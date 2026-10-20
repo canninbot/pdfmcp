@@ -8,7 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"path"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/canninbot/pdfmcp/internal/config"
@@ -22,11 +28,17 @@ const usage = `pdfmcp - local MinerU PDF search MCP
 
 Usage:
   pdfmcp index --root /data/pdfs [--database PATH] [--rebuild]
-  pdfmcp serve --root /data/pdfs [--database PATH] [--sync]
+  pdfmcp serve --root /data/pdfs [--database PATH] [--sync] [--transport stdio|streamable-http]
   pdfmcp search "TEAD inhibition" --root /data/pdfs [search options]
   pdfmcp stats --root /data/pdfs [--database PATH]
   pdfmcp doctor --root /data/pdfs [--database PATH]
 `
+
+const (
+	defaultHTTPListen   = "127.0.0.1:8080"
+	defaultHTTPEndpoint = "/mcp"
+	httpShutdownTimeout = 10 * time.Second
+)
 
 func main() {
 	log.SetOutput(os.Stderr)
@@ -35,7 +47,8 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var err error
 	switch os.Args[1] {
 	case "index":
@@ -96,6 +109,9 @@ func runIndex(ctx context.Context, arguments []string) error {
 func runServe(ctx context.Context, arguments []string) error {
 	flags, root, database := commonFlags("serve")
 	syncIndex := flags.Bool("sync", false, "incrementally synchronize the index before serving")
+	transport := flags.String("transport", "stdio", "MCP transport: stdio or streamable-http")
+	listen := flags.String("listen", defaultHTTPListen, "Streamable HTTP listen address")
+	endpoint := flags.String("endpoint", defaultHTTPEndpoint, "Streamable HTTP endpoint path")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -121,8 +137,75 @@ func runServe(ctx context.Context, arguments []string) error {
 		return err
 	}
 	defer service.Close()
-	// Stdout is reserved exclusively for MCP JSON-RPC framing.
-	return service.Server().Run(ctx, &mcp.StdioTransport{})
+	switch *transport {
+	case "stdio":
+		// Stdout is reserved exclusively for MCP JSON-RPC framing.
+		return service.Server().Run(ctx, &mcp.StdioTransport{})
+	case "streamable-http":
+		handler, err := newStreamableHTTPHandler(service.Server(), *endpoint)
+		if err != nil {
+			return err
+		}
+		log.Printf("Streamable HTTP listening on %s%s (authentication disabled)", *listen, *endpoint)
+		return runHTTPServer(ctx, *listen, handler)
+	default:
+		return fmt.Errorf("transport must be stdio or streamable-http, got %q", *transport)
+	}
+}
+
+// newStreamableHTTPHandler mounts the stateless MCP endpoint at endpoint.
+func newStreamableHTTPHandler(server *mcp.Server, endpoint string) (http.Handler, error) {
+	if endpoint == "" || !strings.HasPrefix(endpoint, "/") ||
+		strings.ContainsAny(endpoint, "?#") || path.Clean(endpoint) != endpoint {
+		return nil, fmt.Errorf("endpoint must be a clean absolute path, got %q", endpoint)
+	}
+	streamable := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{
+			Stateless:                    true,
+			JSONResponse:                 true,
+			PropagateRequestCancellation: true,
+		},
+	)
+	mux := http.NewServeMux()
+	mux.Handle(endpoint, streamable)
+	return mux, nil
+}
+
+// runHTTPServer serves until an error or context cancellation occurs.
+func runHTTPServer(ctx context.Context, address string, handler http.Handler) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", address, err)
+	}
+	server := &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shut down HTTP server: %w", err)
+		}
+		if err := <-result; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
 func runSearch(ctx context.Context, arguments []string) error {

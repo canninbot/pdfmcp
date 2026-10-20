@@ -1,6 +1,6 @@
 # pdfmcp
 
-`pdfmcp` is a read-only Model Context Protocol server and CLI for local scientific PDFs already extracted by MinerU. It provides FTS5/BM25 search, exact native-Go search, source retrieval, and embedded PDFium WebAssembly rendering in one CGO-free executable.
+`pdfmcp` is a read-only Model Context Protocol server and CLI for scientific PDFs already extracted by MinerU. It provides FTS5/BM25 search, exact native-Go search, source retrieval, and embedded PDFium WebAssembly rendering in one CGO-free executable. MCP clients can connect through local stdio or a remotely hosted Streamable HTTP URL.
 
 ## Setup
 
@@ -63,7 +63,9 @@ Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share MCP
 configuration for the same Codex host. Use absolute paths because MCP launchers
 may not expand `~` or resolve paths from the project directory.
 
-The simplest setup uses the Codex CLI:
+#### Local stdio
+
+The simplest local setup uses the Codex CLI:
 
 ```bash
 codex mcp add pdfmcp -- \
@@ -101,8 +103,45 @@ To remove the server later:
 codex mcp remove pdfmcp
 ```
 
-See the official OpenAI documentation for
-[Codex MCP setup](https://learn.chatgpt.com/docs/extend/mcp#connect-codex-to-an-mcp-server).
+#### Remote Streamable HTTP
+
+On the machine that stores the corpus, start a Streamable HTTP endpoint:
+
+```bash
+./pdfmcp serve \
+  --transport streamable-http \
+  --listen 127.0.0.1:8080 \
+  --endpoint /mcp \
+  --root /absolute/path/to/pdfs
+```
+
+Put that listener behind an HTTPS reverse proxy and connect from the local
+computer with its public URL:
+
+```bash
+codex mcp add pdfmcp --url https://pdf.example.com/mcp
+codex mcp get pdfmcp --json
+```
+
+The equivalent `~/.codex/config.toml` entry is:
+
+```toml
+[mcp_servers.pdfmcp]
+url = "https://pdf.example.com/mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+enabled = true
+```
+
+For a private LAN or VPN where TLS terminates elsewhere, bind directly to a
+reachable interface and any available port, for example
+`--listen 0.0.0.0:9090`, then use `http://SERVER:9090/mcp`. The HTTP transport
+currently has no authentication layer. Anyone who can reach the endpoint can
+search the index and retrieve
+corpus content, including PDFs and images, so restrict access with a firewall,
+VPN, or authenticating reverse proxy. Use HTTPS across untrusted networks.
+
+See the official OpenAI documentation for [Codex MCP setup](https://learn.chatgpt.com/docs/extend/mcp#connect-codex-to-an-mcp-server), including Streamable HTTP URL configuration.
 
 ### Other MCP clients
 
@@ -125,7 +164,8 @@ For clients that use JSON server configuration, the equivalent stdio entry is:
 
 The client starts `pdfmcp serve` itself; do not separately launch the server
 for normal stdio use. Server diagnostics go to stderr, while stdout is
-reserved for MCP.
+reserved for MCP. URL-based clients instead connect to the separately running
+Streamable HTTP server at its configured endpoint.
 
 The default database is `ROOT/papers.sqlite`. The corpus remains authoritative:
 the database contains searchable text, metadata, and relative file references,
@@ -185,6 +225,15 @@ pdfmcp doctor --root /data/pdfs
 
 The server never synchronizes automatically. Use `serve --sync` only when an explicit startup sync is wanted. In stdio mode, stdout carries MCP messages exclusively and diagnostics go to stderr.
 
+To host the same MCP surface over a URL, use:
+
+```bash
+pdfmcp serve --transport streamable-http --listen 127.0.0.1:8080 --endpoint /mcp --root /data/pdfs
+```
+
+The default transport is `stdio`. Streamable HTTP defaults to
+`127.0.0.1:8080` and `/mcp`; setting either flag does not change stdio mode.
+
 ## MCP Surface
 
 The server advertises exactly eight tools:
@@ -224,6 +273,9 @@ PDFs and images are sent only when a client reads the resource or invokes an ima
 
 - `--root`: corpus directory; defaults to `./pdfs`
 - `--database`: SQLite path; defaults to `ROOT/papers.sqlite`
+- `serve --transport`: `stdio` (default) or `streamable-http`
+- `serve --listen`: HTTP listen address; defaults to `127.0.0.1:8080`
+- `serve --endpoint`: HTTP endpoint path; defaults to `/mcp`
 - PMID-only search results: maximum 5,000 per request and 1 MiB per MCP response
 - Snippet and full search results: maximum 200 per request
 - Document text: maximum 200,000 characters per request
