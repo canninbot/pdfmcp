@@ -1,0 +1,33 @@
+# User-owned corpora and extracted artifacts
+/pdfs/
+*.pdf
+*.zip
+
+# Generated indexes and SQLite sidecars
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Build and test outputs
+/dist/
+/pdfmcp
+coverage.out
+*.test
+/benchmarks/results/
+/.go-bench-tmp-*/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~
