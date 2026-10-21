@@ -112,6 +112,7 @@ On the machine that stores the corpus, start a Streamable HTTP endpoint:
   --transport streamable-http \
   --listen 127.0.0.1:8080 \
   --endpoint /mcp \
+  --public-url https://pdf.example.com/mcp \
   --root /absolute/path/to/pdfs
 ```
 
@@ -228,7 +229,8 @@ The server never synchronizes automatically. Use `serve --sync` only when an exp
 To host the same MCP surface over a URL, use:
 
 ```bash
-pdfmcp serve --transport streamable-http --listen 127.0.0.1:8080 --endpoint /mcp --root /data/pdfs
+pdfmcp serve --transport streamable-http --listen 127.0.0.1:8080 --endpoint /mcp \
+  --public-url https://pdf.example.com/mcp --root /data/pdfs
 ```
 
 The default transport is `stdio`. Streamable HTTP defaults to
@@ -269,10 +271,12 @@ paper://{pmid}/image/{image}
 ```
 
 PDFs up to 1 MiB are returned inline. Larger PDFs return a small JSON manifest
-with the byte size, SHA-256 digest, and bounded chunk URI; this avoids client
-output truncation caused by base64 expansion. Streamable HTTP clients can avoid
-base64 entirely by making a `GET` request to their configured MCP endpoint with
-`?download=PMID`, for example:
+with the byte size, SHA-256 digest, actionable `download_url`, preferred
+delivery method, and bounded chunk URI. Configure `serve --public-url` with the
+externally reachable MCP endpoint to advertise an absolute download URL. When
+it is omitted, the manifest returns a URL relative to the configured MCP
+endpoint. HTTP-capable clients can avoid base64 entirely with one `GET`, for
+example:
 
 ```bash
 curl -fL 'https://pdf.example.com/mcp?download=39331709' -o 39331709.pdf
@@ -291,6 +295,7 @@ though they can read them.
 - `serve --transport`: `stdio` (default) or `streamable-http`
 - `serve --listen`: HTTP listen address; defaults to `127.0.0.1:8080`
 - `serve --endpoint`: HTTP endpoint path; defaults to `/mcp`
+- `serve --public-url`: externally reachable HTTP(S) MCP endpoint advertised for direct PDF downloads; defaults to a relative URL
 - PMID-only search results: maximum 5,000 per request and 1 MiB per MCP response
 - Snippet and full search results: maximum 200 per request
 - Document text: maximum 200,000 characters per request

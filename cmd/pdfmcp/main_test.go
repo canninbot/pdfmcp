@@ -78,7 +78,7 @@ func TestMCPStreamableHTTPDiscoveryAndInvocation(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	service, err := mcpserver.New(ctx, cfg)
+	service, err := mcpserver.New(ctx, cfg, mcpserver.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

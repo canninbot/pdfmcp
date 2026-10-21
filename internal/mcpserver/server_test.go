@@ -30,7 +30,7 @@ func TestToolDiscoveryInvocationAndResources(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	service, err := New(ctx, cfg)
+	service, err := New(ctx, cfg, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +114,29 @@ func TestDedicatedPMIDResponseLimit(t *testing.T) {
 	}
 }
 
+func TestPublicURLValidationAndRelativeFallback(t *testing.T) {
+	for _, value := range []string{
+		"pdf.example.com/mcp",
+		"ftp://pdf.example.com/mcp",
+		"https://user:secret@pdf.example.com/mcp",
+		"https://pdf.example.com/mcp?token=secret",
+		"https://pdf.example.com/mcp#fragment",
+	} {
+		if _, err := parsePublicURL(value); err == nil {
+			t.Errorf("parsePublicURL(%q) succeeded", value)
+		}
+	}
+	parsed, err := parsePublicURL("https://pdf.example.com/mcp")
+	if err != nil || parsed.String() != "https://pdf.example.com/mcp" {
+		t.Fatalf("valid public URL: %v, %v", parsed, err)
+	}
+	advertisement := (&Service{}).pdfDownloadAdvertisement("12345678")
+	if advertisement["download_url"] != "?download=12345678" ||
+		advertisement["download_url_kind"] != "relative_to_mcp_endpoint" {
+		t.Fatalf("unexpected relative advertisement: %+v", advertisement)
+	}
+}
+
 func TestLargePDFResourceManifestAndChunks(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.CreateCorpus(t)
@@ -143,11 +166,21 @@ func TestLargePDFResourceManifestAndChunks(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	service, err := New(ctx, cfg)
+	service, err := New(ctx, cfg, Options{PublicURL: "https://pdf.example.com/mcp"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer service.Close()
+	_, structured, err := service.getDocumentInfoTool(ctx, nil, pmidArgs{PMID: "12345678"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := structured.(map[string]any)
+	download := info["http_pdf_download"].(map[string]any)
+	if download["download_url"] != "https://pdf.example.com/mcp?download=12345678" ||
+		download["preferred_delivery"] != "direct_http" || download["available"] != true {
+		t.Fatalf("unexpected document download advertisement: %+v", download)
+	}
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	serverSession, err := service.Server().Connect(ctx, serverTransport, nil)
 	if err != nil {
@@ -165,14 +198,19 @@ func TestLargePDFResourceManifestAndChunks(t *testing.T) {
 		t.Fatalf("large PDF manifest: %+v, %v", manifestResource, err)
 	}
 	var manifest struct {
-		SizeBytes int64  `json:"size_bytes"`
-		SHA256    string `json:"sha256"`
+		SizeBytes         int64  `json:"size_bytes"`
+		SHA256            string `json:"sha256"`
+		DownloadURL       string `json:"download_url"`
+		DownloadURLKind   string `json:"download_url_kind"`
+		PreferredDelivery string `json:"preferred_delivery"`
 	}
 	if err := json.Unmarshal([]byte(manifestResource.Contents[0].Text), &manifest); err != nil {
 		t.Fatal(err)
 	}
 	wantDigest := fmt.Sprintf("%x", sha256.Sum256(wantPDF))
-	if manifest.SizeBytes != int64(len(wantPDF)) || manifest.SHA256 != wantDigest {
+	if manifest.SizeBytes != int64(len(wantPDF)) || manifest.SHA256 != wantDigest ||
+		manifest.DownloadURL != "https://pdf.example.com/mcp?download=12345678" ||
+		manifest.DownloadURLKind != "absolute" || manifest.PreferredDelivery != "direct_http" {
 		t.Fatalf("unexpected manifest: %+v", manifest)
 	}
 	var reconstructed []byte

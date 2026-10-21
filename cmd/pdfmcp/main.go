@@ -28,7 +28,7 @@ const usage = `pdfmcp - local MinerU PDF search MCP
 
 Usage:
   pdfmcp index --root /data/pdfs [--database PATH] [--rebuild]
-  pdfmcp serve --root /data/pdfs [--database PATH] [--sync] [--transport stdio|streamable-http]
+  pdfmcp serve --root /data/pdfs [--database PATH] [--sync] [--transport stdio|streamable-http] [--public-url URL]
   pdfmcp search "TEAD inhibition" --root /data/pdfs [search options]
   pdfmcp stats --root /data/pdfs [--database PATH]
   pdfmcp doctor --root /data/pdfs [--database PATH]
@@ -112,6 +112,7 @@ func runServe(ctx context.Context, arguments []string) error {
 	transport := flags.String("transport", "stdio", "MCP transport: stdio or streamable-http")
 	listen := flags.String("listen", defaultHTTPListen, "Streamable HTTP listen address")
 	endpoint := flags.String("endpoint", defaultHTTPEndpoint, "Streamable HTTP endpoint path")
+	publicURL := flags.String("public-url", "", "externally reachable HTTP MCP endpoint advertised for PDF downloads")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -132,7 +133,7 @@ func runServe(ctx context.Context, arguments []string) error {
 		log.Printf("index sync: indexed=%d unchanged=%d deleted=%d failed=%d",
 			progress.Indexed, progress.Unchanged, progress.Deleted, progress.Failed)
 	}
-	service, err := mcpserver.New(ctx, cfg)
+	service, err := mcpserver.New(ctx, cfg, mcpserver.Options{PublicURL: *publicURL})
 	if err != nil {
 		return err
 	}
@@ -146,7 +147,7 @@ func runServe(ctx context.Context, arguments []string) error {
 		if err != nil {
 			return err
 		}
-		log.Printf("Streamable HTTP listening on %s%s (authentication disabled)", *listen, *endpoint)
+		log.Printf("Streamable HTTP listening on %s%s (authentication disabled, public URL %q)", *listen, *endpoint, *publicURL)
 		return runHTTPServer(ctx, *listen, handler)
 	default:
 		return fmt.Errorf("transport must be stdio or streamable-http, got %q", *transport)

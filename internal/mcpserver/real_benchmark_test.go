@@ -21,7 +21,7 @@ func benchmarkRealMCP(b *testing.B, arguments map[string]any) {
 		b.Fatal(err)
 	}
 	ctx := context.Background()
-	service, err := New(ctx, cfg)
+	service, err := New(ctx, cfg, Options{})
 	if err != nil {
 		b.Fatal(err)
 	}

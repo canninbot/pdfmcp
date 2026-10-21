@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	version              = "0.1.3"
+	version              = "0.1.4"
 	maxToolJSONBytes     = 4 << 20
 	maxResourceBytes     = 100 << 20
 	maxInlinePDFBytes    = 1 << 20
@@ -36,11 +36,17 @@ const (
 
 // Service owns the read-only index, search engine, and lazy renderer.
 type Service struct {
-	config   config.Config
-	index    *indexdb.DB
-	search   *search.Engine
-	renderer *renderer.Renderer
-	server   *mcp.Server
+	config    config.Config
+	index     *indexdb.DB
+	search    *search.Engine
+	renderer  *renderer.Renderer
+	server    *mcp.Server
+	publicURL *url.URL
+}
+
+// Options controls transport-aware metadata advertised by the MCP service.
+type Options struct {
+	PublicURL string
 }
 
 type searchArgs struct {
@@ -91,17 +97,34 @@ type renderRegionArgs struct {
 }
 
 // New opens the index read-only and registers exactly eight tools.
-func New(ctx context.Context, cfg config.Config) (*Service, error) {
+//
+// Args:
+//   - ctx: Context used while opening the index.
+//   - cfg: Corpus and database configuration.
+//   - options: Optional externally reachable URL metadata.
+//
+// Returns:
+//   - The configured service, or a validation/open error.
+func New(ctx context.Context, cfg config.Config, options Options) (*Service, error) {
+	publicURL, err := parsePublicURL(options.PublicURL)
+	if err != nil {
+		return nil, err
+	}
 	database, err := indexdb.Open(ctx, cfg, true)
 	if err != nil {
 		return nil, err
 	}
 	service := &Service{
 		config: cfg, index: database, search: search.New(database), renderer: renderer.New(),
+		publicURL: publicURL,
+	}
+	instructions := "Search and retrieve the local read-only MinerU scientific PDF corpus. Large PDF resources return a manifest with chunk URIs."
+	if publicURL != nil {
+		instructions = fmt.Sprintf("For original PDFs, prefer one HTTP GET to %s?download=PMID when the client can fetch URLs and write files; do not reconstruct PDFs from MCP chunks unless HTTP is unavailable. get_document_info and large-PDF manifests provide an exact download_url. %s", publicURL.String(), instructions)
 	}
 	server := mcp.NewServer(&mcp.Implementation{
 		Name: "pdfmcp", Version: version,
-	}, &mcp.ServerOptions{Instructions: "Search and retrieve the local read-only MinerU scientific PDF corpus. Large PDF resources return a manifest with chunk URIs; Streamable HTTP clients can download the original bytes by sending GET to the MCP endpoint with ?download=PMID."})
+	}, &mcp.ServerOptions{Instructions: instructions})
 	service.server = server
 	service.registerTools()
 	service.registerResources()
@@ -111,6 +134,63 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 // Server returns the configured SDK server for stdio or in-memory tests.
 func (s *Service) Server() *mcp.Server {
 	return s.server
+}
+
+// parsePublicURL validates an optional externally reachable MCP endpoint.
+//
+// Args:
+//   - value: Absolute HTTP(S) endpoint, or an empty string.
+//
+// Returns:
+//   - The parsed URL, or a validation error.
+func parsePublicURL(value string) (*url.URL, error) {
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.Opaque != "" {
+		return nil, fmt.Errorf("public URL must be an absolute HTTP(S) URL, got %q", value)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("public URL must use http or https, got %q", parsed.Scheme)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("public URL must not contain credentials, a query, or a fragment")
+	}
+	return parsed, nil
+}
+
+// pdfDownloadAdvertisement describes the preferred original-PDF delivery path.
+//
+// Args:
+//   - pmid: Validated PubMed identifier.
+//
+// Returns:
+//   - Structured metadata suitable for MCP tool and resource responses.
+func (s *Service) pdfDownloadAdvertisement(pmid string) map[string]any {
+	query := "?download=" + url.QueryEscape(pmid)
+	advertisement := map[string]any{
+		"method":             "GET",
+		"download_url":       query,
+		"download_url_kind":  "relative_to_mcp_endpoint",
+		"preferred_delivery": "mcp_chunks",
+		"query":              query,
+		"instruction":        "Resolve download_url against the Streamable HTTP MCP endpoint when available; otherwise use MCP chunks.",
+	}
+	if s.publicURL == nil {
+		advertisement["endpoint"] = "the configured Streamable HTTP MCP endpoint"
+		return advertisement
+	}
+	target := *s.publicURL
+	values := target.Query()
+	values.Set("download", pmid)
+	target.RawQuery = values.Encode()
+	advertisement["endpoint"] = s.publicURL.String()
+	advertisement["download_url"] = target.String()
+	advertisement["download_url_kind"] = "absolute"
+	advertisement["preferred_delivery"] = "direct_http"
+	advertisement["instruction"] = "When HTTP and filesystem access are available, fetch download_url directly instead of reading paper:// PDF chunks."
+	return advertisement
 }
 
 // PDFDownloadHandler streams an original PDF without base64 expansion.
@@ -183,7 +263,7 @@ func (s *Service) registerTools() {
 		Name: "list_documents", Description: "Browse indexed papers in stable PMID order.",
 	}, s.listDocumentsTool)
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name: "get_document_info", Description: "Return metadata, source inventory, outline, figures, tables, and resource URIs.",
+		Name: "get_document_info", Description: "Return metadata, source inventory, outline, figures, tables, resource URIs, and the preferred direct PDF download URL.",
 	}, s.getDocumentInfoTool)
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name: "render_region", Description: "Render an original PDF page or MinerU block crop with embedded PDFium WASM.",
@@ -199,7 +279,7 @@ func (s *Service) registerResources() {
 		{Name: "Paper Markdown", URITemplate: "paper://{pmid}/markdown", MIMEType: "text/markdown"},
 		{Name: "Structured MinerU JSON", URITemplate: "paper://{pmid}/structured", MIMEType: "application/json"},
 		{Name: "Middle MinerU JSON", URITemplate: "paper://{pmid}/middle", MIMEType: "application/json"},
-		{Name: "Original PDF", URITemplate: "paper://{pmid}/pdf", Description: "Inline PDF up to 1 MiB; larger files return a JSON download and chunk manifest."},
+		{Name: "Original PDF", URITemplate: "paper://{pmid}/pdf", Description: "For saving a PDF, prefer the download_url from get_document_info. This resource is inline up to 1 MiB; larger files return a JSON download and chunk manifest."},
 		{Name: "Original PDF chunk", URITemplate: "paper://{pmid}/pdf{?offset,length}", MIMEType: "application/octet-stream", Description: "Bounded byte range from an original PDF; maximum length 256 KiB."},
 		{Name: "Extracted image", URITemplate: "paper://{pmid}/image/{image}", MIMEType: "image/*"},
 	} {
@@ -377,7 +457,7 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 		}
 	}
 	resources := make([]string, 0)
-	pdfDownloadQuery := ""
+	pdfDownload := map[string]any{"available": false}
 	for _, file := range files {
 		switch file.Path {
 		case "markdown.md":
@@ -391,17 +471,16 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 				resources = append(resources, "paper://"+args.PMID+"/image/"+filepath.Base(file.Path))
 			} else if strings.HasSuffix(strings.ToLower(file.Path), ".pdf") {
 				resources = append(resources, "paper://"+args.PMID+"/pdf")
-				pdfDownloadQuery = "?download=" + url.QueryEscape(args.PMID)
+				pdfDownload = s.pdfDownloadAdvertisement(args.PMID)
+				pdfDownload["available"] = true
+				pdfDownload["size_bytes"] = file.Size
 			}
 		}
 	}
 	return jsonToolResult(map[string]any{
 		"document": document, "source_files": files, "section_outline": sections,
 		"figures": figures, "tables": tables, "resource_uris": resources,
-		"http_pdf_download": map[string]any{
-			"method": "GET", "endpoint": "the configured Streamable HTTP MCP endpoint",
-			"query": pdfDownloadQuery,
-		},
+		"http_pdf_download": pdfDownload,
 	}, nil)
 }
 
@@ -505,7 +584,7 @@ func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceReque
 		return nil, fmt.Errorf("resource unavailable or exceeds 100 MiB limit")
 	}
 	if len(components) == 1 && components[0] == "pdf" {
-		return readPDFResource(request.Params.URI, parsed, path, info.Size())
+		return s.readPDFResource(request.Params.URI, parsed, path, info.Size())
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -537,7 +616,7 @@ func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceReque
 //
 // Returns:
 //   - The MCP resource response, or a validation/read error.
-func readPDFResource(uri string, parsed *url.URL, path string, size int64) (*mcp.ReadResourceResult, error) {
+func (s *Service) readPDFResource(uri string, parsed *url.URL, path string, size int64) (*mcp.ReadResourceResult, error) {
 	offset, length, ranged, err := parsePDFRange(parsed, size)
 	if err != nil {
 		return nil, err
@@ -566,14 +645,19 @@ func readPDFResource(uri string, parsed *url.URL, path string, size int64) (*mcp
 		if err != nil {
 			return nil, err
 		}
+		download := s.pdfDownloadAdvertisement(parsed.Host)
 		manifest := map[string]any{
 			"pmid":                       parsed.Host,
 			"mime_type":                  "application/pdf",
 			"size_bytes":                 size,
 			"sha256":                     digest,
-			"http_download_method":       "GET",
-			"http_download_endpoint":     "the configured Streamable HTTP MCP endpoint",
-			"http_download_query":        "?download=" + url.QueryEscape(parsed.Host),
+			"download_url":               download["download_url"],
+			"download_url_kind":          download["download_url_kind"],
+			"preferred_delivery":         download["preferred_delivery"],
+			"delivery_instruction":       download["instruction"],
+			"http_download_method":       download["method"],
+			"http_download_endpoint":     download["endpoint"],
+			"http_download_query":        download["query"],
 			"chunk_uri_template":         "paper://" + parsed.Host + "/pdf?offset={offset}&length={length}",
 			"default_chunk_bytes":        defaultPDFChunkBytes,
 			"maximum_chunk_bytes":        defaultPDFChunkBytes,
