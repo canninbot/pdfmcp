@@ -1,7 +1,13 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -105,5 +111,80 @@ func TestDedicatedPMIDResponseLimit(t *testing.T) {
 	value := map[string]string{"pmids": strings.Repeat("1", 128)}
 	if _, _, err := jsonToolResultLimited(value, 32, "PMID search"); err == nil || !strings.Contains(err.Error(), "PMID search") {
 		t.Fatalf("dedicated response limit was not enforced: %v", err)
+	}
+}
+
+func TestLargePDFResourceManifestAndChunks(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	pdfPath := filepath.Join(cfg.Root, "12345678", "12345678.pdf")
+	file, err := os.OpenFile(pdfPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := bytes.Repeat([]byte("large-pdf-test"), maxInlinePDFBytes/14+1)
+	if _, err := file.Write(padding); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantPDF, err := os.ReadFile(pdfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := indexdb.Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := service.Server().Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "pdf-chunk-test", Version: "1"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	manifestResource, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: "paper://12345678/pdf"})
+	if err != nil || len(manifestResource.Contents) != 1 {
+		t.Fatalf("large PDF manifest: %+v, %v", manifestResource, err)
+	}
+	var manifest struct {
+		SizeBytes int64  `json:"size_bytes"`
+		SHA256    string `json:"sha256"`
+	}
+	if err := json.Unmarshal([]byte(manifestResource.Contents[0].Text), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(wantPDF))
+	if manifest.SizeBytes != int64(len(wantPDF)) || manifest.SHA256 != wantDigest {
+		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+	var reconstructed []byte
+	for offset := int64(0); offset < int64(len(wantPDF)); offset += defaultPDFChunkBytes {
+		uri := fmt.Sprintf("paper://12345678/pdf?offset=%d&length=%d", offset, defaultPDFChunkBytes)
+		chunk, err := clientSession.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+		if err != nil || len(chunk.Contents) != 1 {
+			t.Fatalf("PDF chunk at %d: %+v, %v", offset, chunk, err)
+		}
+		reconstructed = append(reconstructed, chunk.Contents[0].Blob...)
+	}
+	if !bytes.Equal(reconstructed, wantPDF) {
+		t.Fatalf("reconstructed PDF mismatch: got %d bytes, want %d", len(reconstructed), len(wantPDF))
 	}
 }

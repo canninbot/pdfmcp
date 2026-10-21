@@ -142,7 +142,7 @@ func runServe(ctx context.Context, arguments []string) error {
 		// Stdout is reserved exclusively for MCP JSON-RPC framing.
 		return service.Server().Run(ctx, &mcp.StdioTransport{})
 	case "streamable-http":
-		handler, err := newStreamableHTTPHandler(service.Server(), *endpoint)
+		handler, err := newStreamableHTTPHandler(service.Server(), service.PDFDownloadHandler(), *endpoint)
 		if err != nil {
 			return err
 		}
@@ -154,7 +154,7 @@ func runServe(ctx context.Context, arguments []string) error {
 }
 
 // newStreamableHTTPHandler mounts the stateless MCP endpoint at endpoint.
-func newStreamableHTTPHandler(server *mcp.Server, endpoint string) (http.Handler, error) {
+func newStreamableHTTPHandler(server *mcp.Server, pdfDownload http.Handler, endpoint string) (http.Handler, error) {
 	if endpoint == "" || !strings.HasPrefix(endpoint, "/") ||
 		strings.ContainsAny(endpoint, "?#") || path.Clean(endpoint) != endpoint {
 		return nil, fmt.Errorf("endpoint must be a clean absolute path, got %q", endpoint)
@@ -168,7 +168,13 @@ func newStreamableHTTPHandler(server *mcp.Server, endpoint string) (http.Handler
 		},
 	)
 	mux := http.NewServeMux()
-	mux.Handle(endpoint, streamable)
+	mux.Handle(endpoint, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if _, downloadRequested := request.URL.Query()["download"]; downloadRequested {
+			pdfDownload.ServeHTTP(response, request)
+			return
+		}
+		streamable.ServeHTTP(response, request)
+	}))
 	return mux, nil
 }
 

@@ -3,14 +3,17 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -23,8 +26,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.1.0"
-const maxToolJSONBytes = 4 << 20
+const (
+	version              = "0.1.2"
+	maxToolJSONBytes     = 4 << 20
+	maxResourceBytes     = 100 << 20
+	maxInlinePDFBytes    = 1 << 20
+	defaultPDFChunkBytes = 256 << 10
+)
 
 // Service owns the read-only index, search engine, and lazy renderer.
 type Service struct {
@@ -93,7 +101,7 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 	}
 	server := mcp.NewServer(&mcp.Implementation{
 		Name: "pdfmcp", Version: version,
-	}, &mcp.ServerOptions{Instructions: "Search and retrieve the local read-only MinerU scientific PDF corpus."})
+	}, &mcp.ServerOptions{Instructions: "Search and retrieve the local read-only MinerU scientific PDF corpus. Large PDF resources return a manifest with chunk URIs; Streamable HTTP clients can download the original bytes by sending GET to the MCP endpoint with ?download=PMID."})
 	service.server = server
 	service.registerTools()
 	service.registerResources()
@@ -103,6 +111,52 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 // Server returns the configured SDK server for stdio or in-memory tests.
 func (s *Service) Server() *mcp.Server {
 	return s.server
+}
+
+// PDFDownloadHandler streams an original PDF without base64 expansion.
+//
+// The request must use GET or HEAD and include exactly one download=PMID query
+// parameter. Paths are resolved through the corpus store and remain confined to
+// the configured corpus root.
+func (s *Service) PDFDownloadHandler() http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet && request.Method != http.MethodHead {
+			response.Header().Set("Allow", "GET, HEAD")
+			http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		query := request.URL.Query()
+		pmids, ok := query["download"]
+		if !ok || len(query) != 1 || len(pmids) != 1 {
+			http.Error(response, "exactly one download PMID is required", http.StatusBadRequest)
+			return
+		}
+		pmid := pmids[0]
+		if err := corpus.ValidatePMID(pmid); err != nil {
+			http.NotFound(response, request)
+			return
+		}
+		pdfPath, err := s.index.Store().PDF(pmid)
+		if err != nil {
+			http.NotFound(response, request)
+			return
+		}
+		file, err := os.Open(pdfPath)
+		if err != nil {
+			http.NotFound(response, request)
+			return
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || info.Size() > maxResourceBytes {
+			http.Error(response, "PDF unavailable or exceeds 100 MiB limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		response.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", pmid+".pdf"))
+		response.Header().Set("Content-Type", "application/pdf")
+		response.Header().Set("X-Content-Type-Options", "nosniff")
+		http.ServeContent(response, request, pmid+".pdf", info.ModTime(), file)
+	})
 }
 
 // Close releases the renderer and SQLite connections.
@@ -145,7 +199,8 @@ func (s *Service) registerResources() {
 		{Name: "Paper Markdown", URITemplate: "paper://{pmid}/markdown", MIMEType: "text/markdown"},
 		{Name: "Structured MinerU JSON", URITemplate: "paper://{pmid}/structured", MIMEType: "application/json"},
 		{Name: "Middle MinerU JSON", URITemplate: "paper://{pmid}/middle", MIMEType: "application/json"},
-		{Name: "Original PDF", URITemplate: "paper://{pmid}/pdf", MIMEType: "application/pdf"},
+		{Name: "Original PDF", URITemplate: "paper://{pmid}/pdf", Description: "Inline PDF up to 1 MiB; larger files return a JSON download and chunk manifest."},
+		{Name: "Original PDF chunk", URITemplate: "paper://{pmid}/pdf{?offset,length}", MIMEType: "application/octet-stream", Description: "Bounded byte range from an original PDF; maximum length 256 KiB."},
 		{Name: "Extracted image", URITemplate: "paper://{pmid}/image/{image}", MIMEType: "image/*"},
 	} {
 		s.server.AddResourceTemplate(template, handler)
@@ -322,6 +377,7 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 		}
 	}
 	resources := make([]string, 0)
+	pdfDownloadQuery := ""
 	for _, file := range files {
 		switch file.Path {
 		case "markdown.md":
@@ -335,12 +391,17 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 				resources = append(resources, "paper://"+args.PMID+"/image/"+filepath.Base(file.Path))
 			} else if strings.HasSuffix(strings.ToLower(file.Path), ".pdf") {
 				resources = append(resources, "paper://"+args.PMID+"/pdf")
+				pdfDownloadQuery = "?download=" + url.QueryEscape(args.PMID)
 			}
 		}
 	}
 	return jsonToolResult(map[string]any{
 		"document": document, "source_files": files, "section_outline": sections,
 		"figures": figures, "tables": tables, "resource_uris": resources,
+		"http_pdf_download": map[string]any{
+			"method": "GET", "endpoint": "the configured Streamable HTTP MCP endpoint",
+			"query": pdfDownloadQuery,
+		},
 	}, nil)
 }
 
@@ -440,15 +501,18 @@ func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceReque
 		return nil, mcp.ResourceNotFoundError(request.Params.URI)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Size() > 100<<20 {
+	if err != nil || info.Size() > maxResourceBytes {
 		return nil, fmt.Errorf("resource unavailable or exceeds 100 MiB limit")
+	}
+	if len(components) == 1 && components[0] == "pdf" {
+		return readPDFResource(request.Params.URI, parsed, path, info.Size())
 	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 100<<20+1))
+	data, err := io.ReadAll(io.LimitReader(file, maxResourceBytes+1))
 	if err != nil {
 		return nil, err
 	}
@@ -460,6 +524,123 @@ func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceReque
 		content.Blob = data
 	}
 	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{content}}, nil
+}
+
+// readPDFResource returns a small PDF inline, a large-PDF manifest, or a
+// requested bounded byte range.
+//
+// Args:
+//   - uri: Original MCP resource URI.
+//   - parsed: Parsed form of uri.
+//   - path: Safely resolved PDF path.
+//   - size: PDF size in bytes.
+//
+// Returns:
+//   - The MCP resource response, or a validation/read error.
+func readPDFResource(uri string, parsed *url.URL, path string, size int64) (*mcp.ReadResourceResult, error) {
+	offset, length, ranged, err := parsePDFRange(parsed, size)
+	if err != nil {
+		return nil, err
+	}
+	if ranged {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		data := make([]byte, length)
+		if _, err := file.ReadAt(data, offset); err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		content := &mcp.ResourceContents{
+			URI: uri, MIMEType: "application/octet-stream", Blob: data,
+			Meta: mcp.Meta{
+				"offset": offset, "returned_bytes": length, "total_bytes": size,
+				"has_more": offset+length < size,
+			},
+		}
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{content}}, nil
+	}
+	if size > maxInlinePDFBytes {
+		digest, err := fileSHA256(path)
+		if err != nil {
+			return nil, err
+		}
+		manifest := map[string]any{
+			"pmid":                       parsed.Host,
+			"mime_type":                  "application/pdf",
+			"size_bytes":                 size,
+			"sha256":                     digest,
+			"http_download_method":       "GET",
+			"http_download_endpoint":     "the configured Streamable HTTP MCP endpoint",
+			"http_download_query":        "?download=" + url.QueryEscape(parsed.Host),
+			"chunk_uri_template":         "paper://" + parsed.Host + "/pdf?offset={offset}&length={length}",
+			"default_chunk_bytes":        defaultPDFChunkBytes,
+			"maximum_chunk_bytes":        defaultPDFChunkBytes,
+			"default_chunk_count":        (size + defaultPDFChunkBytes - 1) / defaultPDFChunkBytes,
+			"reconstruction_instruction": "Concatenate decoded chunk blobs in ascending offset order and verify SHA-256.",
+		}
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			return nil, err
+		}
+		content := &mcp.ResourceContents{URI: uri, MIMEType: "application/json", Text: string(encoded)}
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{content}}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	content := &mcp.ResourceContents{URI: uri, MIMEType: "application/pdf", Blob: data}
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{content}}, nil
+}
+
+// parsePDFRange validates an optional offset and length query.
+//
+// Args:
+//   - parsed: Parsed PDF resource URI.
+//   - size: Total PDF size in bytes.
+//
+// Returns:
+//   - Offset, effective length, whether a range was requested, and an error.
+func parsePDFRange(parsed *url.URL, size int64) (int64, int64, bool, error) {
+	query := parsed.Query()
+	if len(query) == 0 {
+		return 0, 0, false, nil
+	}
+	if len(query) != 2 || len(query["offset"]) != 1 || len(query["length"]) != 1 {
+		return 0, 0, false, errors.New("PDF chunks require exactly one offset and length")
+	}
+	offset, err := strconv.ParseInt(query.Get("offset"), 10, 64)
+	if err != nil || offset < 0 || offset >= size {
+		return 0, 0, false, fmt.Errorf("PDF chunk offset must be between 0 and %d", max(0, size-1))
+	}
+	length, err := strconv.ParseInt(query.Get("length"), 10, 64)
+	if err != nil || length < 1 || length > defaultPDFChunkBytes {
+		return 0, 0, false, fmt.Errorf("PDF chunk length must be between 1 and %d", defaultPDFChunkBytes)
+	}
+	length = min(length, size-offset)
+	return offset, length, true, nil
+}
+
+// fileSHA256 calculates the lowercase SHA-256 digest of a file.
+//
+// Args:
+//   - path: File to hash.
+//
+// Returns:
+//   - Hexadecimal digest, or a file read error.
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func jsonToolResult(value any, err error) (*mcp.CallToolResult, any, error) {

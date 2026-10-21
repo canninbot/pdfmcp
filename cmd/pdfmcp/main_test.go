@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -79,7 +83,7 @@ func TestMCPStreamableHTTPDiscoveryAndInvocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	handler, err := newStreamableHTTPHandler(service.Server(), defaultHTTPEndpoint)
+	handler, err := newStreamableHTTPHandler(service.Server(), service.PDFDownloadHandler(), defaultHTTPEndpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,11 +116,29 @@ func TestMCPStreamableHTTPDiscoveryAndInvocation(t *testing.T) {
 	if err != nil || result.IsError || len(result.Content) != 1 {
 		t.Fatalf("Streamable HTTP invocation: %+v, %v", result, err)
 	}
+	downloadResponse, err := http.Get(httpServer.URL + defaultHTTPEndpoint + "?download=12345678")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downloadResponse.Body.Close()
+	downloaded, err := io.ReadAll(downloadResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPDF, err := os.ReadFile(filepath.Join(cfg.Root, "12345678", "12345678.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if downloadResponse.StatusCode != http.StatusOK ||
+		downloadResponse.Header.Get("Content-Type") != "application/pdf" ||
+		!bytes.Equal(downloaded, wantPDF) {
+		t.Fatalf("PDF download mismatch: status=%d bytes=%d", downloadResponse.StatusCode, len(downloaded))
+	}
 }
 
 func TestStreamableHTTPEndpointValidation(t *testing.T) {
 	for _, endpoint := range []string{"", "mcp", "/mcp/", "/mcp?token=secret"} {
-		if _, err := newStreamableHTTPHandler(nil, endpoint); err == nil {
+		if _, err := newStreamableHTTPHandler(nil, nil, endpoint); err == nil {
 			t.Errorf("newStreamableHTTPHandler(%q) succeeded", endpoint)
 		}
 	}

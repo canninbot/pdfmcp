@@ -264,10 +264,25 @@ paper://{pmid}/markdown
 paper://{pmid}/structured
 paper://{pmid}/middle
 paper://{pmid}/pdf
+paper://{pmid}/pdf?offset={offset}&length={length}
 paper://{pmid}/image/{image}
 ```
 
-PDFs and images are sent only when a client reads the resource or invokes an image-returning tool. Some MCP clients do not preview binary resources even though they can read them.
+PDFs up to 1 MiB are returned inline. Larger PDFs return a small JSON manifest
+with the byte size, SHA-256 digest, and bounded chunk URI; this avoids client
+output truncation caused by base64 expansion. Streamable HTTP clients can avoid
+base64 entirely by making a `GET` request to their configured MCP endpoint with
+`?download=PMID`, for example:
+
+```bash
+curl -fL 'https://pdf.example.com/mcp?download=39331709' -o 39331709.pdf
+```
+
+Chunk reads accept a length of at most 256 KiB and can reconstruct the PDF in
+clients that only support MCP resources. PDFs and images are sent only when a
+client reads the resource, uses the raw HTTP download, or invokes an
+image-returning tool. Some MCP clients do not preview binary resources even
+though they can read them.
 
 ## Configuration and Limits
 
@@ -280,7 +295,7 @@ PDFs and images are sent only when a client reads the resource or invokes an ima
 - Snippet and full search results: maximum 200 per request
 - Document text: maximum 200,000 characters per request
 - Existing images: maximum 20 MiB
-- Resources: maximum 100 MiB per read
+- Resources: maximum 100 MiB; large PDF chunks are limited to 256 KiB per read
 - Render dimensions: 64–4096 pixels; default 1568
 - Render DPI: maximum 600; default 140
 

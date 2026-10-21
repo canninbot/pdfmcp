@@ -85,6 +85,43 @@ func TestOutputSpecificLimits(t *testing.T) {
 	}
 }
 
+func TestRankedPMIDOutput(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	database, err := indexdb.Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(database)
+	firstPage, err := engine.Search(ctx, Options{
+		Query: `"TEAD inhibition"`, Mode: "ranked", Scope: "text",
+		Output: "pmids", Limit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.PMIDs) != 2 || firstPage.PMIDs[0] == firstPage.PMIDs[1] {
+		t.Fatalf("unexpected ranked PMIDs: %+v", firstPage)
+	}
+	secondPage, err := engine.Search(ctx, Options{
+		Query: `"TEAD inhibition"`, Mode: "ranked", Scope: "text",
+		Output: "pmids", Limit: 1, Offset: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(secondPage.PMIDs, firstPage.PMIDs[1:]) {
+		t.Fatalf("pagination mismatch: first=%+v second=%+v", firstPage, secondPage)
+	}
+	if len(secondPage.Results) != 0 {
+		t.Fatalf("PMID output constructed full results: %+v", secondPage.Results)
+	}
+}
+
 func TestOutputLevelsAndExactSemantics(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.CreateCorpus(t)

@@ -232,24 +232,31 @@ func (e *Engine) rankedPMIDs(ctx context.Context, options Options) ([]string, er
 		}
 		where = append(where, "b.pmid IN ("+strings.Join(placeholders, ",")+")")
 	}
-	arguments = append(arguments, options.Limit, options.Offset)
 	query := `
-		SELECT pmid FROM (
-			SELECT b.pmid AS pmid, MIN(bm25(fts_blocks, 1.0, 0.25)) AS best_score
-			FROM fts_blocks JOIN blocks b ON b.id = fts_blocks.rowid
-			WHERE ` + strings.Join(where, " AND ") + `
-			GROUP BY b.pmid
-		) ORDER BY best_score, pmid LIMIT ? OFFSET ?`
+		SELECT b.pmid
+		FROM fts_blocks JOIN blocks b ON b.id = fts_blocks.rowid
+		WHERE ` + strings.Join(where, " AND ") + `
+		ORDER BY bm25(fts_blocks, 1.0, 0.25), b.pmid, b.id`
 	rows, err := e.index.SQL().QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("ranked PMID query: %w", err)
 	}
 	defer rows.Close()
 	pmids := make([]string, 0, options.Limit)
-	for rows.Next() {
+	seen := make(map[string]struct{})
+	skipped := 0
+	for rows.Next() && len(pmids) < options.Limit {
 		var pmid string
 		if err := rows.Scan(&pmid); err != nil {
 			return nil, err
+		}
+		if _, exists := seen[pmid]; exists {
+			continue
+		}
+		seen[pmid] = struct{}{}
+		if skipped < options.Offset {
+			skipped++
+			continue
 		}
 		pmids = append(pmids, pmid)
 	}
