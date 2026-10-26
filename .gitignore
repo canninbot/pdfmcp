@@ -71,3 +71,4 @@ codex_instructions.txt
 data/*.csv
 data/*.txt
 output/
+__pycache__
