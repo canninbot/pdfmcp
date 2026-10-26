@@ -74,3 +74,4 @@ data/*.csv
 data/*.txt
 output/
 __pycache__
+duplicate_check/
