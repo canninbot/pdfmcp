@@ -57,6 +57,31 @@ command is optional.
 `doctor` should report `root_readable`, `index_readable`, `fts5_available`, and
 `embedded_pdfium_wasm` as `true`.
 
+### Upgrade an existing deployment
+
+Replace the deployed executable with the new version, then run an incremental
+index operation with the annotation CSV. This adds the optional metadata tables
+to the existing SQLite index and preserves the indexed corpus; `--rebuild` is
+not required.
+
+```bash
+# Add metadata tables and import annotations
+/DEPLOY/pdfmcp index \
+  --root /DEPLOY/pdfs \
+  --annotations /DATA/pmids_citations_impact.csv
+
+# Verify the upgraded deployment
+/DEPLOY/pdfmcp doctor --root /DEPLOY/pdfs
+/DEPLOY/pdfmcp search --root /DEPLOY/pdfs \
+  --scope metadata \
+  --metadata-filter 'cited_by_count>100' \
+  --output pmids
+```
+
+Restart the MCP client after upgrading a local stdio deployment. For a remote
+Streamable HTTP deployment, stop the service before replacing the executable
+and restart it after importing the annotations.
+
 ### 4. Configure Codex
 
 Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share MCP
@@ -212,7 +237,7 @@ pdfmcp index --root /data/pdfs
 
 # Optional PMID metadata annotations from the bundled annotation script
 pdfmcp index --root /data/pdfs \
-  --annotations sclc_pmids_citations_impact.csv
+  --annotations pmids_citations_impact.csv
 
 # Full, reproducible rebuild
 pdfmcp index --root /data/pdfs --rebuild
