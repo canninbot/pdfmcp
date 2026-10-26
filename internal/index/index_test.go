@@ -158,3 +158,46 @@ func TestVersionFiveMigratesTrigramsWithoutReindex(t *testing.T) {
 		t.Fatalf("migration unnecessarily reindexed source files: %+v", progress)
 	}
 }
+
+func TestVersionSevenAddsOptionalAnnotationsWithoutReindex(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	database, err := Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SQL().ExecContext(ctx, `DROP TABLE fts_annotations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SQL().ExecContext(ctx, `DROP TABLE annotation_field_stats`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SQL().ExecContext(ctx, `DROP TABLE document_annotations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SQL().ExecContext(ctx,
+		`UPDATE meta SET value = '7' WHERE key = 'schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if !database.HasAnnotationIndex() {
+		t.Fatal("optional annotation schema was not added")
+	}
+	progress, err := database.Sync(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Unchanged != 2 || progress.Indexed != 0 || progress.Annotations != nil {
+		t.Fatalf("annotation migration changed default indexing: %+v", progress)
+	}
+}

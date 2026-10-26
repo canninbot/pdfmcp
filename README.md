@@ -210,6 +210,10 @@ The importer supports partial and version-varying MinerU JSON. It prefers struct
 # Incremental synchronization
 pdfmcp index --root /data/pdfs
 
+# Optional PMID metadata annotations from the bundled annotation script
+pdfmcp index --root /data/pdfs \
+  --annotations sclc_pmids_citations_impact.csv
+
 # Full, reproducible rebuild
 pdfmcp index --root /data/pdfs --rebuild
 
@@ -219,12 +223,53 @@ pdfmcp search 'exact substring' --mode literal --context-lines 2 --root /data/pd
 pdfmcp search 'TEAD\s+(inhibition|blockade)' --mode regex --scope all --root /data/pdfs
 pdfmcp search sin3 --mode literal --scope text --output pmids --root /data/pdfs
 pdfmcp search sin3 --mode literal --scope all --output snippets --debug --root /data/pdfs
+pdfmcp search 'Clinical Trial' --mode literal --scope metadata --root /data/pdfs
+pdfmcp search --scope metadata --metadata-filter 'cited_by_count>100' \
+  --output pmids --root /data/pdfs
 
 pdfmcp stats --root /data/pdfs
 pdfmcp doctor --root /data/pdfs
 ```
 
 The server never synchronizes automatically. Use `serve --sync` only when an explicit startup sync is wanted. In stdio mode, stdout carries MCP messages exclusively and diagnostics go to stderr.
+
+Metadata annotations are optional and separate from extracted paper content.
+`index --annotations FILE.csv` imports the PMID-keyed CSV produced by
+`scripts/annotate_pmids_citations_impact.py`; rows without an indexed PMID are
+reported and skipped. Known annotation columns are stored with JSON boolean,
+number, array, object, or null types, while unknown columns are retained as
+strings for forward compatibility. Omitting `--annotations` leaves existing
+indexing and search behavior unchanged. Annotation search requires the explicit
+`scope=metadata`; `scope=all` continues to mean the original text, figure, and
+table content only.
+
+Metadata searches also accept up to 16 optional numeric predicates. An MCP
+agent supplies them structurally, so it can filter without a text query:
+
+```json
+{
+  "scope": "metadata",
+  "metadata_filters": [
+    {"field": "cited_by_count", "operator": ">", "value": 100}
+  ],
+  "output": "pmids"
+}
+```
+
+Add a `query` and `mode` to combine a predicate with metadata text such as a
+study design. Supported operators are `=`, `!=`, `>`, `>=`, `<`, and `<=`.
+Numeric fields are `publication_year`, `cited_by_count`,
+`scimago_match_count`, `scimago_rank`, `scimago_sjr`, and
+`scimago_h_index`.
+
+Every metadata search response and annotation resource includes
+`completeness_warnings` for columns populated in less than 75% of annotations
+matched to indexed papers. `pmcid` (and the alias `pmcids`) is exempt from this
+warning. Treat searches over a warned field as lower bounds: for example, a
+`study_designs` search for `Clinical Trial` can retrieve matching populated
+records but cannot establish that unreturned papers are not clinical trials.
+The `search` MCP tool description carries the same guidance so agents see it
+before invoking the tool.
 
 To host the same MCP surface over a URL, use:
 
@@ -249,7 +294,7 @@ The server advertises exactly eight tools:
 7. `render_region`
 8. `corpus_stats`
 
-`search` is the only search tool. Its `mode` selects ranked FTS5, literal substring, or Go RE2 regex behavior; `scope` selects text, figures, tables, or all canonical content. `output` selects `pmids`, `snippets`, or `full` and defaults to the existing rich `full` response. Optional `debug` output reports the selected internal strategy.
+`search` is the only search tool. Its `mode` selects ranked FTS5, literal substring, or Go RE2 regex behavior; `scope` selects text, figures, tables, all canonical content, or the separate optional metadata annotations. `output` selects `pmids`, `snippets`, or `full` and defaults to the existing rich `full` response. Optional `debug` output reports the selected internal strategy.
 
 Ranked queries use the BM25 index. Eligible literal and regex queries over
 indexed blocks use a document-level, contentless FTS5 trigram prefilter followed
@@ -265,6 +310,7 @@ Direct resources use these templates:
 paper://{pmid}/markdown
 paper://{pmid}/structured
 paper://{pmid}/middle
+paper://{pmid}/annotations
 paper://{pmid}/pdf
 paper://{pmid}/pdf?offset={offset}&length={length}
 paper://{pmid}/image/{image}
@@ -292,6 +338,8 @@ though they can read them.
 
 - `--root`: corpus directory; defaults to `./pdfs`
 - `--database`: SQLite path; defaults to `ROOT/papers.sqlite`
+- `index --annotations`: optional PMID metadata annotation CSV; omitted by default
+- `search --metadata-filter`: repeatable numeric metadata predicate such as `cited_by_count>100`
 - `serve --transport`: `stdio` (default) or `streamable-http`
 - `serve --listen`: HTTP listen address; defaults to `127.0.0.1:8080`
 - `serve --endpoint`: HTTP endpoint path; defaults to `/mcp`

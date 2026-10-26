@@ -4,6 +4,7 @@ package mcpserver
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,16 +51,17 @@ type Options struct {
 }
 
 type searchArgs struct {
-	Query         string   `json:"query" jsonschema:"required search expression"`
-	Mode          string   `json:"mode,omitempty" jsonschema:"ranked, literal, or regex; default ranked"`
-	Scope         string   `json:"scope,omitempty" jsonschema:"text, figures, tables, or all; default text"`
-	PMIDs         []string `json:"pmids,omitempty" jsonschema:"optional PMID allowlist"`
-	CaseSensitive bool     `json:"case_sensitive,omitempty" jsonschema:"case-sensitive literal or regex matching"`
-	ContextLines  int      `json:"context_lines,omitempty" jsonschema:"surrounding lines for exact modes, maximum 20"`
-	Limit         int      `json:"limit,omitempty" jsonschema:"result limit, default 20; maximum 5000 for pmids and 200 otherwise"`
-	Offset        int      `json:"offset,omitempty" jsonschema:"result offset"`
-	Output        string   `json:"output,omitempty" jsonschema:"pmids, snippets, or full; default full"`
-	Debug         bool     `json:"debug,omitempty" jsonschema:"include query-planner diagnostics"`
+	Query           string                  `json:"query,omitempty" jsonschema:"search expression; optional when metadata_filters are supplied"`
+	Mode            string                  `json:"mode,omitempty" jsonschema:"ranked, literal, or regex; default ranked"`
+	Scope           string                  `json:"scope,omitempty" jsonschema:"text, figures, tables, metadata, or all; default text"`
+	PMIDs           []string                `json:"pmids,omitempty" jsonschema:"optional PMID allowlist"`
+	CaseSensitive   bool                    `json:"case_sensitive,omitempty" jsonschema:"case-sensitive literal or regex matching"`
+	ContextLines    int                     `json:"context_lines,omitempty" jsonschema:"surrounding lines for exact modes, maximum 20"`
+	Limit           int                     `json:"limit,omitempty" jsonschema:"result limit, default 20; maximum 5000 for pmids and 200 otherwise"`
+	Offset          int                     `json:"offset,omitempty" jsonschema:"result offset"`
+	Output          string                  `json:"output,omitempty" jsonschema:"pmids, snippets, or full; default full"`
+	Debug           bool                    `json:"debug,omitempty" jsonschema:"include query-planner diagnostics"`
+	MetadataFilters []search.MetadataFilter `json:"metadata_filters,omitempty" jsonschema:"optional numeric predicates for metadata scope"`
 }
 
 type pmidArgs struct {
@@ -248,7 +250,7 @@ func (s *Service) Close() error {
 
 func (s *Service) registerTools() {
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name: "search", Description: "Search all indexed papers using ranked FTS5, literal substring, or RE2 regex mode.",
+		Name: "search", Description: "Search indexed paper content or optional metadata using ranked FTS5, literal substring, or RE2 regex mode. Metadata responses warn for every field below 75% completeness except pmcid. Sparse fields such as study_designs cannot produce exhaustive cohorts: a Clinical Trial query finds only records with populated matching study_designs, and missing values do not mean a paper is not a clinical trial.",
 	}, s.searchTool)
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name: "get_document", Description: "Read a bounded page of one paper's extracted Markdown.",
@@ -279,6 +281,7 @@ func (s *Service) registerResources() {
 		{Name: "Paper Markdown", URITemplate: "paper://{pmid}/markdown", MIMEType: "text/markdown"},
 		{Name: "Structured MinerU JSON", URITemplate: "paper://{pmid}/structured", MIMEType: "application/json"},
 		{Name: "Middle MinerU JSON", URITemplate: "paper://{pmid}/middle", MIMEType: "application/json"},
+		{Name: "Metadata annotations", URITemplate: "paper://{pmid}/annotations", MIMEType: "application/json"},
 		{Name: "Original PDF", URITemplate: "paper://{pmid}/pdf", Description: "For saving a PDF, prefer the download_url from get_document_info. This resource is inline up to 1 MiB; larger files return a JSON download and chunk manifest."},
 		{Name: "Original PDF chunk", URITemplate: "paper://{pmid}/pdf{?offset,length}", MIMEType: "application/octet-stream", Description: "Bounded byte range from an original PDF; maximum length 256 KiB."},
 		{Name: "Extracted image", URITemplate: "paper://{pmid}/image/{image}", MIMEType: "image/*"},
@@ -292,6 +295,7 @@ func (s *Service) searchTool(ctx context.Context, _ *mcp.CallToolRequest, args s
 		Query: args.Query, Mode: args.Mode, Scope: args.Scope, PMIDs: args.PMIDs,
 		CaseSensitive: args.CaseSensitive, ContextLines: args.ContextLines,
 		Limit: args.Limit, Offset: args.Offset, Output: args.Output, Debug: args.Debug,
+		MetadataFilters: args.MetadataFilters,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -457,6 +461,13 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 		}
 	}
 	resources := make([]string, 0)
+	var annotation *indexdb.Annotation
+	if value, annotationErr := s.index.GetAnnotation(ctx, args.PMID); annotationErr == nil {
+		annotation = &value
+		resources = append(resources, "paper://"+args.PMID+"/annotations")
+	} else if !errors.Is(annotationErr, sql.ErrNoRows) {
+		return nil, nil, annotationErr
+	}
 	pdfDownload := map[string]any{"available": false}
 	for _, file := range files {
 		switch file.Path {
@@ -477,11 +488,15 @@ func (s *Service) getDocumentInfoTool(ctx context.Context, _ *mcp.CallToolReques
 			}
 		}
 	}
-	return jsonToolResult(map[string]any{
+	response := map[string]any{
 		"document": document, "source_files": files, "section_outline": sections,
 		"figures": figures, "tables": tables, "resource_uris": resources,
 		"http_pdf_download": pdfDownload,
-	}, nil)
+	}
+	if annotation != nil {
+		response["metadata_annotation"] = annotation
+	}
+	return jsonToolResult(response, nil)
 }
 
 func (s *Service) renderRegionTool(ctx context.Context, _ *mcp.CallToolRequest, args renderRegionArgs) (*mcp.CallToolResult, any, error) {
@@ -545,7 +560,7 @@ func (s *Service) corpusStatsTool(ctx context.Context, _ *mcp.CallToolRequest, _
 	return jsonToolResult(stats, err)
 }
 
-func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+func (s *Service) readResource(ctx context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	parsed, err := url.Parse(request.Params.URI)
 	if err != nil || parsed.Scheme != "paper" {
 		return nil, mcp.ResourceNotFoundError(request.Params.URI)
@@ -563,6 +578,18 @@ func (s *Service) readResource(_ context.Context, request *mcp.ReadResourceReque
 	}
 	var path string
 	switch {
+	case len(components) == 1 && components[0] == "annotations":
+		annotation, annotationErr := s.index.GetAnnotation(ctx, pmid)
+		if annotationErr != nil {
+			return nil, mcp.ResourceNotFoundError(request.Params.URI)
+		}
+		encoded, annotationErr := json.Marshal(annotation)
+		if annotationErr != nil {
+			return nil, annotationErr
+		}
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
+			URI: request.Params.URI, MIMEType: "application/json", Text: string(encoded),
+		}}}, nil
 	case len(components) == 1 && components[0] == "markdown":
 		path, err = s.index.Store().ResolveSource(pmid, "markdown.md")
 	case len(components) == 1 && components[0] == "structured":

@@ -16,7 +16,7 @@ const (
 	// MaxQueryLimit remains the browsing and detailed-output limit.
 	MaxQueryLimit   = MaxDetailedQueryLimit
 	MaxContextLines = 20
-	SchemaVersion   = 7
+	SchemaVersion   = 8
 )
 
 // Config contains the corpus and database locations used by all commands.

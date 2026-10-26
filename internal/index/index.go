@@ -46,6 +46,25 @@ CREATE TABLE IF NOT EXISTS documents (
     diagnostics_json TEXT,
     original_pdf TEXT
 );
+CREATE TABLE IF NOT EXISTS document_annotations (
+    pmid TEXT PRIMARY KEY,
+    annotation_json TEXT NOT NULL,
+    searchable_text TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    imported_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS annotation_field_stats (
+    field_name TEXT PRIMARY KEY,
+    present_count INTEGER NOT NULL,
+    total_count INTEGER NOT NULL,
+    completeness REAL NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_annotations USING fts5(
+    pmid UNINDEXED,
+    searchable_text,
+    detail=full,
+    tokenize='unicode61 remove_diacritics 2'
+);
 CREATE TABLE IF NOT EXISTS blocks (
     id INTEGER PRIMARY KEY,
     pmid TEXT NOT NULL REFERENCES documents(pmid) ON DELETE CASCADE,
@@ -123,18 +142,23 @@ type DB struct {
 	store    *corpus.Store
 	readOnly bool
 	trigram  bool
+	// annotations reports whether the optional metadata annotation schema exists.
+	annotations bool
+	// annotationStats reports whether per-field completeness data is available.
+	annotationStats bool
 	// schemaMismatch forces a file-authoritative rebuild on the next sync.
 	schemaMismatch bool
 }
 
 // Progress summarizes an index synchronization.
 type Progress struct {
-	Discovered int      `json:"discovered"`
-	Indexed    int      `json:"indexed"`
-	Unchanged  int      `json:"unchanged"`
-	Deleted    int      `json:"deleted"`
-	Failed     int      `json:"failed"`
-	Messages   []string `json:"messages,omitempty"`
+	Discovered  int                       `json:"discovered"`
+	Indexed     int                       `json:"indexed"`
+	Unchanged   int                       `json:"unchanged"`
+	Deleted     int                       `json:"deleted"`
+	Failed      int                       `json:"failed"`
+	Messages    []string                  `json:"messages,omitempty"`
+	Annotations *AnnotationImportProgress `json:"annotations,omitempty"`
 }
 
 // Document describes one indexed paper.
@@ -179,6 +203,7 @@ type Stats struct {
 	LastIndexedAt      string `json:"last_indexing_time,omitempty"`
 	MissingFiles       int    `json:"missing_file_count"`
 	MalformedDocuments int    `json:"malformed_file_count"`
+	AnnotatedPapers    int    `json:"annotated_paper_count,omitempty"`
 }
 
 // Open opens an index and creates its schema when writable.
@@ -201,7 +226,7 @@ func Open(ctx context.Context, cfg config.Config, readOnly bool) (*DB, error) {
 		return nil, fmt.Errorf("open index: %w", err)
 	}
 	database.SetMaxOpenConns(8)
-	result := &DB{db: database, path: cfg.Database, root: cfg.Root, store: store, readOnly: readOnly}
+	result := &DB{db: database, path: cfg.Database, root: store.Root(), store: store, readOnly: readOnly}
 	if !readOnly {
 		if _, err := database.ExecContext(ctx, schema); err != nil {
 			database.Close()
@@ -223,7 +248,8 @@ func Open(ctx context.Context, cfg config.Config, readOnly bool) (*DB, error) {
 		default:
 			switch {
 			case storedVersion == config.SchemaVersion:
-			case (storedVersion == 5 || storedVersion == 6) && config.SchemaVersion == 7:
+			case storedVersion == 7 && config.SchemaVersion == 8:
+			case (storedVersion == 5 || storedVersion == 6) && config.SchemaVersion == 8:
 				if err := result.rebuildDocumentTrigrams(ctx); err != nil {
 					database.Close()
 					return nil, fmt.Errorf("migrate trigram index: %w", err)
@@ -245,6 +271,12 @@ func Open(ctx context.Context, cfg config.Config, readOnly bool) (*DB, error) {
 	_ = database.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM sqlite_master
 		              WHERE type = 'table' AND name = 'fts_documents_trigram')`).Scan(&result.trigram)
+	_ = database.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sqlite_master
+		              WHERE type = 'table' AND name = 'document_annotations')`).Scan(&result.annotations)
+	_ = database.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sqlite_master
+		              WHERE type = 'table' AND name = 'annotation_field_stats')`).Scan(&result.annotationStats)
 	return result, nil
 }
 
@@ -266,6 +298,11 @@ func (d *DB) Store() *corpus.Store {
 // HasTrigramIndex reports whether the optional exact-search accelerator exists.
 func (d *DB) HasTrigramIndex() bool {
 	return d.trigram
+}
+
+// HasAnnotationIndex reports whether optional metadata annotations are supported.
+func (d *DB) HasAnnotationIndex() bool {
+	return d.annotations
 }
 
 // Sync incrementally synchronizes the database with corpus files.
@@ -379,6 +416,23 @@ func (d *DB) Sync(ctx context.Context, rebuild bool) (Progress, error) {
 			return progress, fmt.Errorf("delete removed PMID %s: %w", pmid, err)
 		}
 		progress.Deleted++
+	}
+	if _, err := d.db.ExecContext(ctx, `
+		DELETE FROM fts_annotations
+		WHERE pmid NOT IN (SELECT pmid FROM documents)`); err != nil {
+		return progress, fmt.Errorf("delete annotation search rows for removed documents: %w", err)
+	}
+	annotationCleanup, err := d.db.ExecContext(ctx, `
+		DELETE FROM document_annotations
+		WHERE pmid NOT IN (SELECT pmid FROM documents)`)
+	if err != nil {
+		return progress, fmt.Errorf("delete annotations for removed documents: %w", err)
+	}
+	removedAnnotations, _ := annotationCleanup.RowsAffected()
+	if removedAnnotations > 0 {
+		if err := d.rebuildAnnotationFieldStats(ctx); err != nil {
+			return progress, fmt.Errorf("refresh annotation completeness: %w", err)
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err = d.db.ExecContext(ctx,
@@ -701,6 +755,13 @@ func (d *DB) CorpusStats(ctx context.Context) (Stats, error) {
 	}
 	if err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blocks`).Scan(&stats.Records); err != nil {
 		return stats, err
+	}
+	if d.annotations {
+		if err := d.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM document_annotations AS a
+			JOIN documents AS d ON d.pmid = a.pmid`).Scan(&stats.AnnotatedPapers); err != nil {
+			return stats, err
+		}
 	}
 	if err := d.db.QueryRowContext(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN diagnostics_json LIKE '%no such file%' THEN 1 ELSE 0 END), 0)

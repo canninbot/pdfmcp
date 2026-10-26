@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,18 +30,45 @@ const maxSnippetRunes = 2_000
 const defaultSearchTimeout = 30 * time.Second
 const maxPooledMarkdownBytes = 2 << 20
 
+const maxMetadataFilters = 16
+
+var metadataFilterPattern = regexp.MustCompile(
+	`^\s*([A-Za-z][A-Za-z0-9_.]*)\s*(>=|<=|!=|==|=|>|<)\s*(-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))\s*$`,
+)
+
+var metadataNumericFields = map[string]struct{}{
+	"publication_year":    {},
+	"cited_by_count":      {},
+	"scimago_match_count": {},
+	"scimago_rank":        {},
+	"scimago_sjr":         {},
+	"scimago_h_index":     {},
+}
+
+var metadataFilterOperators = map[string]struct{}{
+	"=": {}, "!=": {}, ">": {}, ">=": {}, "<": {}, "<=": {},
+}
+
+// MetadataFilter is one optional numeric predicate over typed annotation data.
+type MetadataFilter struct {
+	Field    string  `json:"field"`
+	Operator string  `json:"operator"`
+	Value    float64 `json:"value"`
+}
+
 // Options is the shared CLI and MCP search request.
 type Options struct {
-	Query         string   `json:"query"`
-	Mode          string   `json:"mode,omitempty"`
-	Scope         string   `json:"scope,omitempty"`
-	PMIDs         []string `json:"pmids,omitempty"`
-	CaseSensitive bool     `json:"case_sensitive,omitempty"`
-	ContextLines  int      `json:"context_lines,omitempty"`
-	Limit         int      `json:"limit,omitempty"`
-	Offset        int      `json:"offset,omitempty"`
-	Output        string   `json:"output,omitempty"`
-	Debug         bool     `json:"debug,omitempty"`
+	Query           string           `json:"query"`
+	Mode            string           `json:"mode,omitempty"`
+	Scope           string           `json:"scope,omitempty"`
+	PMIDs           []string         `json:"pmids,omitempty"`
+	CaseSensitive   bool             `json:"case_sensitive,omitempty"`
+	ContextLines    int              `json:"context_lines,omitempty"`
+	Limit           int              `json:"limit,omitempty"`
+	Offset          int              `json:"offset,omitempty"`
+	Output          string           `json:"output,omitempty"`
+	Debug           bool             `json:"debug,omitempty"`
+	MetadataFilters []MetadataFilter `json:"metadata_filters,omitempty"`
 }
 
 // Result is a source-traceable search hit.
@@ -60,15 +88,17 @@ type Result struct {
 
 // Response includes applied pagination values.
 type Response struct {
-	Query   string   `json:"query"`
-	Mode    string   `json:"mode"`
-	Scope   string   `json:"scope"`
-	Output  string   `json:"output"`
-	Limit   int      `json:"limit"`
-	Offset  int      `json:"offset"`
-	Results []Result `json:"results"`
-	PMIDs   []string `json:"pmids,omitempty"`
-	Debug   *Debug   `json:"debug,omitempty"`
+	Query                string                                  `json:"query"`
+	Mode                 string                                  `json:"mode"`
+	Scope                string                                  `json:"scope"`
+	Output               string                                  `json:"output"`
+	Limit                int                                     `json:"limit"`
+	Offset               int                                     `json:"offset"`
+	Results              []Result                                `json:"results"`
+	PMIDs                []string                                `json:"pmids,omitempty"`
+	Debug                *Debug                                  `json:"debug,omitempty"`
+	MetadataFilters      []MetadataFilter                        `json:"metadata_filters,omitempty"`
+	CompletenessWarnings []indexdb.AnnotationCompletenessWarning `json:"completeness_warnings,omitempty"`
 }
 
 // Debug describes the selected search strategy without logging to stdout.
@@ -96,9 +126,42 @@ func (e *Engine) Search(ctx context.Context, options Options) (Response, error) 
 	if err := normalizeOptions(&options); err != nil {
 		return Response{}, err
 	}
+	if options.Scope == "metadata" && !e.index.HasAnnotationIndex() {
+		return Response{}, errors.New("metadata annotations are unavailable; run pdfmcp index with --annotations")
+	}
 	results := make([]Result, 0)
 	pmids := make([]string, 0)
 	var err error
+	if options.Scope == "metadata" {
+		if options.Query == "" {
+			results, pmids, err = e.filteredMetadata(ctx, options)
+		} else if options.Mode == "ranked" {
+			if options.Output == "pmids" {
+				pmids, err = e.rankedMetadataPMIDs(ctx, options)
+			} else {
+				results, err = e.rankedMetadata(ctx, options)
+				if options.Output == "snippets" {
+					minimizeResults(results)
+				}
+			}
+		} else {
+			results, pmids, err = e.exactMetadata(ctx, options)
+		}
+		warnings, warningErr := e.index.AnnotationCompletenessWarnings(ctx)
+		if err == nil {
+			err = warningErr
+		}
+		response := Response{
+			Query: options.Query, Mode: options.Mode, Scope: options.Scope,
+			Output: options.Output, Limit: options.Limit, Offset: options.Offset,
+			Results: results, PMIDs: pmids, MetadataFilters: options.MetadataFilters,
+			CompletenessWarnings: warnings,
+		}
+		if options.Debug {
+			response.Debug = e.strategyDebug(options)
+		}
+		return response, err
+	}
 	switch options.Mode {
 	case "ranked":
 		if options.Output == "pmids" {
@@ -126,6 +189,15 @@ func (e *Engine) Search(ctx context.Context, options Options) (Response, error) 
 }
 
 func (e *Engine) strategyDebug(options Options) *Debug {
+	if options.Scope == "metadata" {
+		if options.Query == "" {
+			return &Debug{Strategy: "sqlite-metadata-filter", Reason: "filter-only metadata search evaluates typed JSON values"}
+		}
+		if options.Mode == "ranked" {
+			return &Debug{Strategy: "fts5-metadata", Reason: "metadata scope uses the separate annotation token index"}
+		}
+		return &Debug{Strategy: "sqlite-metadata-scan", Reason: "exact metadata search verifies the separate annotation text"}
+	}
 	if options.Mode == "ranked" {
 		return &Debug{Strategy: "fts5-bm25", Reason: "ranked mode uses the token index"}
 	}
@@ -142,12 +214,287 @@ func (e *Engine) strategyDebug(options Options) *Debug {
 	return &Debug{Strategy: "sqlite-stream-scan", Reason: "no correctness-safe indexed prerequisite is available"}
 }
 
+// ParseMetadataFilter parses a CLI numeric predicate such as cited_by_count>100.
+func ParseMetadataFilter(expression string) (MetadataFilter, error) {
+	match := metadataFilterPattern.FindStringSubmatch(expression)
+	if len(match) != 4 {
+		return MetadataFilter{}, fmt.Errorf("metadata filter must be FIELD OPERATOR NUMBER, got %q", expression)
+	}
+	operator := match[2]
+	if operator == "==" {
+		operator = "="
+	}
+	value, err := strconv.ParseFloat(match[3], 64)
+	if err != nil {
+		return MetadataFilter{}, fmt.Errorf("parse metadata filter value: %w", err)
+	}
+	filter := MetadataFilter{Field: match[1], Operator: operator, Value: value}
+	if err := validateMetadataFilter(filter); err != nil {
+		return MetadataFilter{}, err
+	}
+	return filter, nil
+}
+
+func validateMetadataFilter(filter MetadataFilter) error {
+	if _, ok := metadataNumericFields[filter.Field]; !ok {
+		return fmt.Errorf("metadata field %q is not a supported numeric field", filter.Field)
+	}
+	if _, ok := metadataFilterOperators[filter.Operator]; !ok {
+		return fmt.Errorf("metadata filter operator %q is not supported", filter.Operator)
+	}
+	return nil
+}
+
+func metadataFilterClause(alias string, filters []MetadataFilter) (string, []any, error) {
+	clauses := make([]string, 0, len(filters))
+	arguments := make([]any, 0, len(filters)*2)
+	for _, filter := range filters {
+		if err := validateMetadataFilter(filter); err != nil {
+			return "", nil, err
+		}
+		clauses = append(clauses, fmt.Sprintf(
+			"CAST(json_extract(%s.annotation_json, ?) AS REAL) %s ?",
+			alias, filter.Operator,
+		))
+		arguments = append(arguments, "$."+filter.Field, filter.Value)
+	}
+	return strings.Join(clauses, " AND "), arguments, nil
+}
+
+func (e *Engine) filteredMetadata(ctx context.Context, options Options) ([]Result, []string, error) {
+	clause, arguments, err := metadataFilterClause("a", options.MetadataFilters)
+	if err != nil {
+		return nil, nil, err
+	}
+	query := `
+		SELECT a.pmid, COALESCE(d.title, ''), a.searchable_text
+		FROM document_annotations AS a
+		JOIN documents AS d ON d.pmid = a.pmid
+		WHERE ` + clause
+	if len(options.PMIDs) > 0 {
+		encoded, err := json.Marshal(options.PMIDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		query += ` AND a.pmid IN (SELECT value FROM json_each(?))`
+		arguments = append(arguments, string(encoded))
+	}
+	query += ` ORDER BY a.pmid LIMIT ? OFFSET ?`
+	arguments = append(arguments, options.Limit, options.Offset)
+	rows, err := e.index.SQL().QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("filtered metadata query: %w", err)
+	}
+	defer rows.Close()
+	results := make([]Result, 0, options.Limit)
+	pmids := make([]string, 0, options.Limit)
+	for rows.Next() {
+		var document indexdb.Document
+		var searchable string
+		if err := rows.Scan(&document.PMID, &document.Title, &searchable); err != nil {
+			return nil, nil, err
+		}
+		if options.Output == "pmids" {
+			pmids = append(pmids, document.PMID)
+			continue
+		}
+		results = append(results, Result{
+			PMID: document.PMID, Title: document.Title,
+			Snippet: truncateRunes(searchable, maxSnippetRunes), ContentType: "metadata",
+			ResourceURI: "paper://" + document.PMID + "/annotations",
+		})
+	}
+	if options.Output == "snippets" {
+		minimizeResults(results)
+	}
+	return results, pmids, rows.Err()
+}
+
 func minimizeResults(results []Result) {
 	for position := range results {
 		results[position].Title = ""
 		results[position].Section = ""
 		results[position].Score = nil
 	}
+}
+
+func (e *Engine) rankedMetadata(ctx context.Context, options Options) ([]Result, error) {
+	where := []string{"fts_annotations MATCH ?"}
+	arguments := []any{options.Query}
+	filterClause, filterArguments, err := metadataFilterClause("m", options.MetadataFilters)
+	if err != nil {
+		return nil, err
+	}
+	if filterClause != "" {
+		where = append(where, filterClause)
+		arguments = append(arguments, filterArguments...)
+	}
+	if len(options.PMIDs) > 0 {
+		encoded, err := json.Marshal(options.PMIDs)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "a.pmid IN (SELECT value FROM json_each(?))")
+		arguments = append(arguments, string(encoded))
+	}
+	arguments = append(arguments, options.Limit, options.Offset)
+	rows, err := e.index.SQL().QueryContext(ctx, `
+		SELECT a.pmid, COALESCE(d.title, ''),
+		       bm25(fts_annotations, 0.0, 1.0),
+		       snippet(fts_annotations, 1, '<mark>', '</mark>', ' ... ', 40)
+		FROM fts_annotations AS a
+		JOIN document_annotations AS m ON m.pmid = a.pmid
+		JOIN documents AS d ON d.pmid = a.pmid
+		WHERE `+strings.Join(where, " AND ")+`
+		ORDER BY bm25(fts_annotations, 0.0, 1.0), a.pmid
+		LIMIT ? OFFSET ?`, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("ranked metadata query: %w", err)
+	}
+	defer rows.Close()
+	results := make([]Result, 0, options.Limit)
+	for rows.Next() {
+		var result Result
+		var score float64
+		if err := rows.Scan(&result.PMID, &result.Title, &score, &result.Snippet); err != nil {
+			return nil, err
+		}
+		result.Score = &score
+		result.ContentType = "metadata"
+		result.ResourceURI = "paper://" + result.PMID + "/annotations"
+		results = append(results, result)
+	}
+	return results, rows.Err()
+}
+
+func (e *Engine) rankedMetadataPMIDs(ctx context.Context, options Options) ([]string, error) {
+	where := []string{"fts_annotations MATCH ?"}
+	arguments := []any{options.Query}
+	filterClause, filterArguments, err := metadataFilterClause("m", options.MetadataFilters)
+	if err != nil {
+		return nil, err
+	}
+	if filterClause != "" {
+		where = append(where, filterClause)
+		arguments = append(arguments, filterArguments...)
+	}
+	if len(options.PMIDs) > 0 {
+		encoded, err := json.Marshal(options.PMIDs)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "a.pmid IN (SELECT value FROM json_each(?))")
+		arguments = append(arguments, string(encoded))
+	}
+	arguments = append(arguments, options.Limit, options.Offset)
+	rows, err := e.index.SQL().QueryContext(ctx, `
+		SELECT a.pmid FROM fts_annotations AS a
+		JOIN document_annotations AS m ON m.pmid = a.pmid
+		WHERE `+strings.Join(where, " AND ")+`
+		ORDER BY bm25(fts_annotations, 0.0, 1.0), a.pmid
+		LIMIT ? OFFSET ?`, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("ranked metadata PMID query: %w", err)
+	}
+	defer rows.Close()
+	pmids := make([]string, 0, options.Limit)
+	for rows.Next() {
+		var pmid string
+		if err := rows.Scan(&pmid); err != nil {
+			return nil, err
+		}
+		pmids = append(pmids, pmid)
+	}
+	return pmids, rows.Err()
+}
+
+func (e *Engine) exactMetadata(ctx context.Context, options Options) ([]Result, []string, error) {
+	var regex *regexp.Regexp
+	if options.Mode == "regex" {
+		pattern := options.Query
+		if !options.CaseSensitive {
+			pattern = "(?i)" + pattern
+		}
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid RE2 expression: %w", err)
+		}
+		regex = compiled
+	}
+	query := `
+		SELECT a.pmid, COALESCE(d.title, ''), a.searchable_text
+		FROM document_annotations AS a
+		JOIN documents AS d ON d.pmid = a.pmid`
+	clauses := make([]string, 0, 2)
+	arguments := make([]any, 0, len(options.MetadataFilters)*2+1)
+	filterClause, filterArguments, err := metadataFilterClause("a", options.MetadataFilters)
+	if err != nil {
+		return nil, nil, err
+	}
+	if filterClause != "" {
+		clauses = append(clauses, filterClause)
+		arguments = append(arguments, filterArguments...)
+	}
+	if len(options.PMIDs) > 0 {
+		encoded, err := json.Marshal(options.PMIDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		clauses = append(clauses, `a.pmid IN (SELECT value FROM json_each(?))`)
+		arguments = append(arguments, string(encoded))
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, " AND ")
+	}
+	query += ` ORDER BY a.pmid`
+	rows, err := e.index.SQL().QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("exact metadata query: %w", err)
+	}
+	defer rows.Close()
+	needed := options.Offset + options.Limit
+	results := make([]Result, 0, needed)
+	pmids := make([]string, 0, needed)
+	for rows.Next() {
+		var document indexdb.Document
+		var searchable string
+		if err := rows.Scan(&document.PMID, &document.Title, &searchable); err != nil {
+			return nil, nil, err
+		}
+		if options.Output == "pmids" {
+			if searchableMatches(searchable, options, regex) {
+				pmids = append(pmids, document.PMID)
+			}
+			if len(pmids) >= needed {
+				break
+			}
+			continue
+		}
+		lines := strings.Split(strings.ReplaceAll(searchable, "\r\n", "\n"), "\n")
+		matches := matchingLines(document, lines, options, regex, "metadata", "",
+			"paper://"+document.PMID+"/annotations")
+		results = append(results, matches...)
+		if len(results) >= needed {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if options.Output == "pmids" {
+		if options.Offset >= len(pmids) {
+			return []Result{}, []string{}, nil
+		}
+		return []Result{}, pmids[options.Offset:min(needed, len(pmids))], nil
+	}
+	if options.Offset >= len(results) {
+		return []Result{}, []string{}, nil
+	}
+	results = results[options.Offset:min(needed, len(results))]
+	if options.Output == "snippets" {
+		minimizeResults(results)
+	}
+	return results, []string{}, nil
 }
 
 func (e *Engine) ranked(ctx context.Context, options Options) ([]Result, error) {
@@ -1052,7 +1399,7 @@ func (e *Engine) candidateDocuments(ctx context.Context, pmids []string) ([]inde
 
 func normalizeOptions(options *Options) error {
 	options.Query = strings.TrimSpace(options.Query)
-	if options.Query == "" {
+	if options.Query == "" && !(options.Scope == "metadata" && len(options.MetadataFilters) > 0) {
 		return errors.New("query is required")
 	}
 	if options.Mode == "" {
@@ -1089,8 +1436,19 @@ func normalizeOptions(options *Options) error {
 	if options.Mode == "ranked" && options.CaseSensitive {
 		return errors.New("ranked FTS5 search is case-insensitive; use literal or regex mode for case-sensitive matching")
 	}
-	if _, err := scopeClause(options.Scope); err != nil && options.Scope != "all" {
+	if _, err := scopeClause(options.Scope); err != nil && options.Scope != "all" && options.Scope != "metadata" {
 		return err
+	}
+	if len(options.MetadataFilters) > 0 && options.Scope != "metadata" {
+		return errors.New("metadata_filters require scope metadata")
+	}
+	if len(options.MetadataFilters) > maxMetadataFilters {
+		return fmt.Errorf("metadata_filters cannot contain more than %d predicates", maxMetadataFilters)
+	}
+	for _, filter := range options.MetadataFilters {
+		if err := validateMetadataFilter(filter); err != nil {
+			return err
+		}
 	}
 	for _, pmid := range options.PMIDs {
 		if err := corpus.ValidatePMID(pmid); err != nil {
@@ -1129,6 +1487,9 @@ func scopeClause(scope string) (string, error) {
 func resourceURI(pmid, contentType, imagePath string) string {
 	if contentType == "figure" && imagePath != "" {
 		return "paper://" + pmid + "/image/" + filepath.Base(imagePath)
+	}
+	if contentType == "metadata" {
+		return "paper://" + pmid + "/annotations"
 	}
 	return "paper://" + pmid + "/structured"
 }

@@ -3,6 +3,7 @@ package testutil
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -14,6 +15,29 @@ import (
 
 	"github.com/canninbot/pdfmcp/internal/config"
 )
+
+// WriteAnnotationsCSV writes representative typed metadata annotations.
+func WriteAnnotationsCSV(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := csv.NewWriter(file)
+	records := [][]string{
+		{"pmid", "pmcid", "pmc_fulltext_available", "open_access.is_oa", "best_oa_location", "publication_year", "study_designs", "cited_by_count", "journal_name", "scimago_sjr", "scimago_best_quartile"},
+		{"12345678", "", "true", "true", `{"license":"cc-by"}`, "2024", "Clinical Trial|Randomized Controlled Trial", "142", "Synthetic Oncology", "2,047", "Q1"},
+		{"23456789", "", "false", "false", "", "2023", "", "7", "Synthetic Reviews", "0,512", "Q3"},
+		{"99999999", "", "false", "true", "", "2022", "Case Report", "1", "Unmatched Journal", "1,000", "Q2"},
+	}
+	if err := writer.WriteAll(records); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // CreateCorpus writes two representative papers and returns configuration.
 func CreateCorpus(t *testing.T) config.Config {

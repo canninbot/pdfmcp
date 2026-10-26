@@ -181,6 +181,29 @@ field groups include:
 A PMID that OpenAlex cannot resolve remains in the output with `not_found`
 status and blank publication fields.
 
+The resulting CSV can optionally be imported into `pdfmcp` without changing
+the default paper-content index:
+
+```bash
+pdfmcp index --root /data/pdfs \
+  --annotations pmids_citations_impact.csv
+```
+
+Imported annotations are queried explicitly with `search --scope metadata` and
+are exposed as `paper://PMID/annotations` resources.
+
+Typed numeric values can be filtered without a text query:
+
+```bash
+pdfmcp search --root /data/pdfs --scope metadata \
+  --metadata-filter 'cited_by_count>100' --output pmids
+```
+
+`pdfmcp` calculates completeness over imported rows that match indexed PMIDs.
+Metadata responses warn when any field other than `pmcid` is below 75%
+complete. A metadata query such as `"study_designs Clinical Trial"` therefore
+returns known matches, not a guaranteed exhaustive cohort.
+
 ## Command-line options
 
 ```text

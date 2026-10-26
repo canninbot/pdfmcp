@@ -42,7 +42,8 @@ func New(root string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("evaluate root: %w", err)
 	}
-	return &Store{root: filepath.Clean(absRoot), realRoot: filepath.Clean(realRoot)}, nil
+	canonicalRoot := filepath.Clean(realRoot)
+	return &Store{root: canonicalRoot, realRoot: canonicalRoot}, nil
 }
 
 // Root returns the configured absolute corpus root.

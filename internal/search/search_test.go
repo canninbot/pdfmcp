@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -54,6 +55,99 @@ func TestRankedLiteralRegexScopesAndPagination(t *testing.T) {
 	})
 	if err != nil || len(page.Results) != 1 || page.Results[0].PMID != "23456789" {
 		t.Fatalf("pagination: %+v, %v", page, err)
+	}
+}
+
+func TestOptionalMetadataSearchIsSeparate(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	database, err := indexdb.Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	annotations := filepath.Join(t.TempDir(), "annotations.csv")
+	testutil.WriteAnnotationsCSV(t, annotations)
+	if _, err := database.ImportAnnotations(ctx, annotations); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(database)
+	tests := []struct {
+		name    string
+		options Options
+		want    string
+	}{
+		{name: "ranked", options: Options{Query: `"Clinical Trial"`, Mode: "ranked", Scope: "metadata"}, want: "12345678"},
+		{name: "literal", options: Options{Query: "Q3", Mode: "literal", Scope: "metadata"}, want: "23456789"},
+		{name: "regex", options: Options{Query: `Randomized\s+Controlled`, Mode: "regex", Scope: "metadata"}, want: "12345678"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response, err := engine.Search(ctx, test.options)
+			if err != nil || len(response.Results) != 1 || response.Results[0].PMID != test.want ||
+				response.Results[0].ContentType != "metadata" ||
+				response.Results[0].ResourceURI != "paper://"+test.want+"/annotations" {
+				t.Fatalf("unexpected metadata search: %+v, %v", response, err)
+			}
+		})
+	}
+	defaultSearch, err := engine.Search(ctx, Options{
+		Query: "Clinical Trial", Mode: "literal", Scope: "all",
+	})
+	if err != nil || len(defaultSearch.Results) != 0 {
+		t.Fatalf("scope=all included optional metadata: %+v, %v", defaultSearch, err)
+	}
+	pmids, err := engine.Search(ctx, Options{
+		Query: "Synthetic Reviews", Mode: "literal", Scope: "metadata", Output: "pmids",
+	})
+	if err != nil || !slices.Equal(pmids.PMIDs, []string{"23456789"}) {
+		t.Fatalf("metadata PMID output: %+v, %v", pmids, err)
+	}
+	warningFields := make(map[string]struct{}, len(pmids.CompletenessWarnings))
+	for _, warning := range pmids.CompletenessWarnings {
+		warningFields[warning.Field] = struct{}{}
+	}
+	if _, ok := warningFields["study_designs"]; !ok {
+		t.Fatalf("metadata search omitted study_designs warning: %+v", pmids)
+	}
+	if _, ok := warningFields["pmcid"]; ok {
+		t.Fatalf("metadata search warned for exempt pmcid: %+v", pmids)
+	}
+	filtered, err := engine.Search(ctx, Options{
+		Scope: "metadata", Output: "pmids",
+		MetadataFilters: []MetadataFilter{{Field: "cited_by_count", Operator: ">", Value: 100}},
+	})
+	if err != nil || !slices.Equal(filtered.PMIDs, []string{"12345678"}) {
+		t.Fatalf("filter-only metadata output: %+v, %v", filtered, err)
+	}
+	combined, err := engine.Search(ctx, Options{
+		Query: `"Clinical Trial"`, Mode: "ranked", Scope: "metadata",
+		MetadataFilters: []MetadataFilter{{Field: "cited_by_count", Operator: ">", Value: 100}},
+	})
+	if err != nil || len(combined.Results) != 1 || combined.Results[0].PMID != "12345678" {
+		t.Fatalf("combined metadata filter: %+v, %v", combined, err)
+	}
+}
+
+func TestMetadataFilterParsingAndValidation(t *testing.T) {
+	filter, err := ParseMetadataFilter("cited_by_count > 100")
+	if err != nil || filter != (MetadataFilter{Field: "cited_by_count", Operator: ">", Value: 100}) {
+		t.Fatalf("parsed filter: %+v, %v", filter, err)
+	}
+	for _, expression := range []string{"title=10", "cited_by_count~100", "cited_by_count>many"} {
+		if _, err := ParseMetadataFilter(expression); err == nil {
+			t.Errorf("ParseMetadataFilter(%q) succeeded", expression)
+		}
+	}
+	options := Options{
+		Query: "TEAD", Scope: "text",
+		MetadataFilters: []MetadataFilter{{Field: "cited_by_count", Operator: ">", Value: 100}},
+	}
+	if err := normalizeOptions(&options); err == nil || !strings.Contains(err.Error(), "scope metadata") {
+		t.Fatalf("metadata filter was accepted for text scope: %v", err)
 	}
 }
 

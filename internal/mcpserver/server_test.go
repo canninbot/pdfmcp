@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	indexdb "github.com/canninbot/pdfmcp/internal/index"
+	"github.com/canninbot/pdfmcp/internal/search"
 	"github.com/canninbot/pdfmcp/internal/testutil"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -52,12 +53,19 @@ func TestToolDiscoveryInvocationAndResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := make([]string, 0, len(listed.Tools))
+	searchDescription := ""
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
+		if tool.Name == "search" {
+			searchDescription = tool.Description
+		}
 	}
 	slices.Sort(names)
 	if !slices.Equal(names, ToolNames()) {
 		t.Fatalf("advertised tools differ: %v", names)
+	}
+	if !strings.Contains(searchDescription, "75% completeness") || !strings.Contains(searchDescription, "study_designs") {
+		t.Fatalf("search description omitted missingness guidance: %q", searchDescription)
 	}
 	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
 		Name: "search", Arguments: map[string]any{
@@ -111,6 +119,68 @@ func TestDedicatedPMIDResponseLimit(t *testing.T) {
 	value := map[string]string{"pmids": strings.Repeat("1", 128)}
 	if _, _, err := jsonToolResultLimited(value, 32, "PMID search"); err == nil || !strings.Contains(err.Error(), "PMID search") {
 		t.Fatalf("dedicated response limit was not enforced: %v", err)
+	}
+}
+
+func TestOptionalMetadataAnnotationInfoAndResource(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	database, err := indexdb.Open(ctx, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	annotations := filepath.Join(t.TempDir(), "annotations.csv")
+	testutil.WriteAnnotationsCSV(t, annotations)
+	if _, err := database.ImportAnnotations(ctx, annotations); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(ctx, cfg, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	_, structured, err := service.getDocumentInfoTool(ctx, nil, pmidArgs{PMID: "12345678"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := structured.(map[string]any)
+	if info["metadata_annotation"] == nil {
+		t.Fatalf("document info omitted annotation: %+v", info)
+	}
+	resource, err := service.readResource(ctx, &mcp.ReadResourceRequest{
+		Params: &mcp.ReadResourceParams{URI: "paper://12345678/annotations"},
+	})
+	if err != nil || len(resource.Contents) != 1 {
+		t.Fatalf("annotation resource: %+v, %v", resource, err)
+	}
+	var annotation indexdb.Annotation
+	if err := json.Unmarshal([]byte(resource.Contents[0].Text), &annotation); err != nil {
+		t.Fatal(err)
+	}
+	if annotation.Source != "annotations.csv" || !bytes.Contains(annotation.Data, []byte(`"journal_name":"Synthetic Oncology"`)) {
+		t.Fatalf("unexpected annotation resource: %+v", annotation)
+	}
+	_, filtered, err := service.searchTool(ctx, nil, searchArgs{
+		Scope: "metadata", Output: "pmids",
+		MetadataFilters: []search.MetadataFilter{{Field: "cited_by_count", Operator: ">", Value: 100}},
+	})
+	if err != nil || !slices.Equal(filtered.(search.Response).PMIDs, []string{"12345678"}) {
+		t.Fatalf("MCP metadata filter: %+v, %v", filtered, err)
+	}
+
+	_, unannotated, err := service.getDocumentInfoTool(ctx, nil, pmidArgs{PMID: "23456789"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unannotated.(map[string]any)["metadata_annotation"] == nil {
+		t.Fatal("second imported annotation was omitted")
 	}
 }
 
@@ -176,6 +246,9 @@ func TestLargePDFResourceManifestAndChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	info := structured.(map[string]any)
+	if _, exists := info["metadata_annotation"]; exists {
+		t.Fatalf("default document info included absent optional metadata: %+v", info)
+	}
 	download := info["http_pdf_download"].(map[string]any)
 	if download["download_url"] != "https://pdf.example.com/mcp?download=12345678" ||
 		download["preferred_delivery"] != "direct_http" || download["available"] != true {

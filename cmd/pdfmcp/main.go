@@ -27,7 +27,7 @@ import (
 const usage = `pdfmcp - local MinerU PDF search MCP
 
 Usage:
-  pdfmcp index --root /data/pdfs [--database PATH] [--rebuild]
+  pdfmcp index --root /data/pdfs [--database PATH] [--annotations FILE.csv] [--rebuild]
   pdfmcp serve --root /data/pdfs [--database PATH] [--sync] [--transport stdio|streamable-http] [--public-url URL]
   pdfmcp search "TEAD inhibition" --root /data/pdfs [search options]
   pdfmcp stats --root /data/pdfs [--database PATH]
@@ -87,6 +87,7 @@ func parseConfig(root, database string) (config.Config, error) {
 func runIndex(ctx context.Context, arguments []string) error {
 	flags, root, database := commonFlags("index")
 	rebuild := flags.Bool("rebuild", false, "fully rebuild the index")
+	annotations := flags.String("annotations", "", "PMID metadata annotation CSV to import")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -100,6 +101,11 @@ func runIndex(ctx context.Context, arguments []string) error {
 	}
 	defer db.Close()
 	progress, err := db.Sync(ctx, *rebuild)
+	if err == nil && *annotations != "" {
+		annotationProgress, annotationErr := db.ImportAnnotations(ctx, *annotations)
+		progress.Annotations = &annotationProgress
+		err = annotationErr
+	}
 	if encodeErr := writeJSON(progress); err == nil {
 		err = encodeErr
 	}
@@ -226,13 +232,22 @@ func runSearch(ctx context.Context, arguments []string) error {
 	}
 	flags, root, database := commonFlags("search")
 	mode := flags.String("mode", "ranked", "ranked, literal, or regex")
-	scope := flags.String("scope", "text", "text, figures, tables, or all")
+	scope := flags.String("scope", "text", "text, figures, tables, metadata, or all")
 	caseSensitive := flags.Bool("case-sensitive", false, "enable case-sensitive exact matching")
 	contextLines := flags.Int("context-lines", 0, "surrounding context lines")
 	limit := flags.Int("limit", 20, "result limit")
 	offset := flags.Int("offset", 0, "result offset")
 	output := flags.String("output", "full", "pmids, snippets, or full")
 	debug := flags.Bool("debug", false, "include query-planner diagnostics")
+	metadataFilters := make([]search.MetadataFilter, 0)
+	flags.Func("metadata-filter", "repeatable numeric predicate, for example cited_by_count>100", func(value string) error {
+		filter, err := search.ParseMetadataFilter(value)
+		if err != nil {
+			return err
+		}
+		metadataFilters = append(metadataFilters, filter)
+		return nil
+	})
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -251,7 +266,7 @@ func runSearch(ctx context.Context, arguments []string) error {
 	response, err := search.New(db).Search(ctx, search.Options{
 		Query: query, Mode: *mode, Scope: *scope, CaseSensitive: *caseSensitive,
 		ContextLines: *contextLines, Limit: *limit, Offset: *offset, Output: *output,
-		Debug: *debug,
+		Debug: *debug, MetadataFilters: metadataFilters,
 	})
 	if err != nil {
 		return err
