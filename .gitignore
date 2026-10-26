@@ -1,5 +1,7 @@
 # User-owned corpora and extracted artifacts
 /pdfs/
+/pdfs_*/
+/*.tar.gz
 *.pdf
 *.zip
 
