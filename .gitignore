@@ -75,3 +75,9 @@ data/*.txt
 output/
 __pycache__
 duplicate_check/
+net_pdf_issues_20261026.md
+bad_pmids_manual_check_20261026.txt
+pdfs_concern_20261026_prompt.md
+pdfs_concern_20261026.txt
+pmids_concern_20261026.txt
+pmids_concern_20261026_citations_impact.csv
