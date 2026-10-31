@@ -1,9 +1,12 @@
 package search
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -42,6 +45,40 @@ func TestFilesystemSearchWithoutIndex(t *testing.T) {
 	}
 	if _, err := os.Stat(cfg.Database); !os.IsNotExist(err) {
 		t.Fatalf("indexless search created a database: %v", err)
+	}
+}
+
+func TestMarkdownReaderMatchesLongAndFinalLines(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		options Options
+		regex   *regexp.Regexp
+		matcher *lowerMatcher
+	}{
+		{
+			name:    "literal beyond buffer",
+			data:    append(bytes.Repeat([]byte{'x'}, 70*1024), []byte("TaRgEt\n")...),
+			options: Options{Query: "target", Mode: "literal"},
+			matcher: newLowerMatcher("target"),
+		},
+		{
+			name:    "regex on final line",
+			data:    []byte("first line\r\nfinal 123"),
+			options: Options{Query: `final\s+[0-9]+`, Mode: "regex"},
+			regex:   regexp.MustCompile(`(?i)final\s+[0-9]+`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := bufio.NewReaderSize(bytes.NewReader(test.data), 64*1024)
+			matched, err := markdownReaderMatches(
+				reader, test.options, test.regex, test.matcher, &bytes.Buffer{},
+			)
+			if err != nil || !matched {
+				t.Fatalf("matched=%t, err=%v", matched, err)
+			}
+		})
 	}
 }
 

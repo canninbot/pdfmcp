@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -127,31 +128,20 @@ func NewFilesystem(root string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	pmids, err := store.Discover()
+	sources, err := store.DiscoverMarkdown()
 	if err != nil {
 		return nil, err
 	}
-	documents := make([]indexdb.Document, 0, len(pmids))
-	for _, pmid := range pmids {
-		if _, err := store.ResolveSource(pmid, "markdown.md"); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("resolve Markdown for PMID %s: %w", pmid, err)
-		}
-		dir, err := store.DocumentDir(pmid)
-		if err != nil {
-			return nil, err
-		}
-		relative, err := filepath.Rel(store.Root(), dir)
-		if err != nil {
-			return nil, fmt.Errorf("resolve relative document path for PMID %s: %w", pmid, err)
-		}
-		documents = append(documents, indexdb.Document{
-			PMID: pmid, RelativePath: filepath.ToSlash(relative),
-		})
+	engine := &Engine{
+		store: store, unindexedDocuments: make([]indexdb.Document, 0, len(sources)),
 	}
-	return &Engine{store: store, unindexedDocuments: documents}, nil
+	for _, source := range sources {
+		engine.unindexedDocuments = append(engine.unindexedDocuments, indexdb.Document{
+			PMID: source.PMID, RelativePath: source.RelativePath,
+		})
+		engine.markdownPaths.Store(source.PMID, source.Path)
+	}
+	return engine, nil
 }
 
 // Search validates options and runs exactly one selected search mode.
@@ -1075,8 +1065,9 @@ func (e *Engine) scanMarkdownBatch(
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			buffer := e.markdownBuffer()
-			defer e.releaseMarkdownBuffer(buffer)
+			reader := bufio.NewReaderSize(bytes.NewReader(nil), 64*1024)
+			lineBuffer := e.markdownBuffer()
+			defer e.releaseMarkdownBuffer(lineBuffer)
 			for position := range jobs {
 				if ctx.Err() != nil {
 					return
@@ -1103,8 +1094,10 @@ func (e *Engine) scanMarkdownBatch(
 					}
 					return
 				}
-				buffer.Reset()
-				_, readErr := buffer.ReadFrom(file)
+				reader.Reset(file)
+				matchedValue, readErr := markdownReaderMatches(
+					reader, options, regex, matcher, lineBuffer,
+				)
 				closeErr := file.Close()
 				if readErr != nil {
 					select {
@@ -1120,7 +1113,7 @@ func (e *Engine) scanMarkdownBatch(
 					}
 					return
 				}
-				matched[position] = markdownDataMatches(buffer.Bytes(), options, regex, matcher)
+				matched[position] = matchedValue
 			}
 		}()
 	}
@@ -1144,6 +1137,52 @@ func (e *Engine) scanMarkdownBatch(
 		return nil, err
 	default:
 		return matched, nil
+	}
+}
+
+func markdownReaderMatches(
+	reader *bufio.Reader,
+	options Options,
+	regex *regexp.Regexp,
+	matcher *lowerMatcher,
+	lineBuffer *bytes.Buffer,
+) (bool, error) {
+	if strings.ContainsAny(options.Query, "\r\n") {
+		return false, nil
+	}
+	lineBuffer.Reset()
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			_, _ = lineBuffer.Write(fragment)
+			continue
+		}
+		line := fragment
+		if lineBuffer.Len() > 0 {
+			_, _ = lineBuffer.Write(fragment)
+			line = lineBuffer.Bytes()
+		}
+		line = bytes.TrimSuffix(line, []byte{'\n'})
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		matched := false
+		switch {
+		case options.Mode == "regex":
+			matched = regex.Match(line)
+		case options.CaseSensitive:
+			matched = bytes.Contains(line, []byte(options.Query))
+		default:
+			matched = matcher.MatchBytes(line)
+		}
+		if matched {
+			return true, nil
+		}
+		lineBuffer.Reset()
+		switch {
+		case errors.Is(err, io.EOF):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
 	}
 }
 
@@ -1175,30 +1214,6 @@ func (e *Engine) markdownPath(document indexdb.Document) (string, error) {
 	}
 	e.markdownPaths.Store(document.PMID, path)
 	return path, nil
-}
-
-func markdownDataMatches(
-	data []byte,
-	options Options,
-	regex *regexp.Regexp,
-	matcher *lowerMatcher,
-) bool {
-	if options.Mode == "regex" {
-		for _, line := range bytes.Split(data, []byte{'\n'}) {
-			line = bytes.TrimSuffix(line, []byte{'\r'})
-			if regex.Match(line) {
-				return true
-			}
-		}
-		return false
-	}
-	if strings.ContainsAny(options.Query, "\r\n") {
-		return false
-	}
-	if options.CaseSensitive {
-		return bytes.Contains(data, []byte(options.Query))
-	}
-	return matcher.MatchBytes(data)
 }
 
 // lowerMatcher performs allocation-free case-insensitive literal matching with
@@ -1254,9 +1269,14 @@ func indexASCIIFold(data, needle []byte) int {
 	if len(needle) == 0 {
 		return 0
 	}
-	for start := 0; start+len(needle) <= len(data); start++ {
-		if foldASCII(data[start]) != needle[0] {
-			continue
+	for offset := 0; offset+len(needle) <= len(data); {
+		candidate := indexASCIIFoldByte(data[offset:], needle[0])
+		if candidate < 0 {
+			return -1
+		}
+		start := offset + candidate
+		if start+len(needle) > len(data) {
+			return -1
 		}
 		matched := true
 		for position := 1; position < len(needle); position++ {
@@ -1268,8 +1288,25 @@ func indexASCIIFold(data, needle []byte) int {
 		if matched {
 			return start
 		}
+		offset = start + 1
 	}
 	return -1
+}
+
+func indexASCIIFoldByte(data []byte, needle byte) int {
+	lower := foldASCII(needle)
+	lowerIndex := bytes.IndexByte(data, lower)
+	if lower < 'a' || lower > 'z' {
+		return lowerIndex
+	}
+	upperIndex := bytes.IndexByte(data, lower-'a'+'A')
+	if lowerIndex < 0 {
+		return upperIndex
+	}
+	if upperIndex < 0 || lowerIndex < upperIndex {
+		return lowerIndex
+	}
+	return upperIndex
 }
 
 func foldASCII(value byte) byte {

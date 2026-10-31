@@ -24,6 +24,13 @@ type FileInfo struct {
 	Size     int64  `json:"size"`
 }
 
+// MarkdownDocument identifies one safely resolved Markdown corpus document.
+type MarkdownDocument struct {
+	PMID         string
+	RelativePath string
+	Path         string
+}
+
 // Store safely resolves corpus documents and resources.
 type Store struct {
 	root      string
@@ -93,6 +100,72 @@ func (s *Store) Discover() ([]string, error) {
 	s.documents = seen
 	s.mu.Unlock()
 	return pmids, nil
+}
+
+// DiscoverMarkdown finds PMID directories with a safe, regular markdown.md.
+func (s *Store) DiscoverMarkdown() ([]MarkdownDocument, error) {
+	documentsByPMID := make(map[string]MarkdownDocument)
+	directories := make(map[string]string)
+	err := filepath.WalkDir(s.root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.IsDir() || path == s.root || ValidatePMID(entry.Name()) != nil {
+			return nil
+		}
+		markdownPath := filepath.Join(path, "markdown.md")
+		info, err := os.Lstat(markdownPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if hasMineruFile(path) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return err
+		}
+		resolved := markdownPath
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, err = s.ensureInside(markdownPath)
+			if err != nil {
+				return fmt.Errorf("resolve Markdown for PMID %s: %w", entry.Name(), err)
+			}
+			info, err = os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("not a regular file: markdown.md")
+		}
+		relative, err := filepath.Rel(s.root, path)
+		if err != nil {
+			return err
+		}
+		documentsByPMID[entry.Name()] = MarkdownDocument{
+			PMID: entry.Name(), RelativePath: filepath.ToSlash(relative), Path: resolved,
+		}
+		directories[entry.Name()] = path
+		return filepath.SkipDir
+	})
+	if err != nil {
+		return nil, fmt.Errorf("discover Markdown documents: %w", err)
+	}
+	documents := make([]MarkdownDocument, 0, len(documentsByPMID))
+	for _, document := range documentsByPMID {
+		documents = append(documents, document)
+	}
+	sort.Slice(documents, func(i, j int) bool { return documents[i].PMID < documents[j].PMID })
+	s.mu.Lock()
+	s.documents = directories
+	s.mu.Unlock()
+	return documents, nil
 }
 
 // DocumentDir safely returns the directory for a discovered PMID.

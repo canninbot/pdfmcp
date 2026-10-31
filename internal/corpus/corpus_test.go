@@ -3,6 +3,7 @@ package corpus
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/canninbot/pdfmcp/internal/testutil"
@@ -34,6 +35,53 @@ func TestDiscoveryAndSafePaths(t *testing.T) {
 	}
 	if _, err := store.ResolveImage("12345678", "escape.png"); err == nil {
 		t.Fatal("symlink escape succeeded")
+	}
+}
+
+func TestDiscoverMarkdownCachesResolvedDocuments(t *testing.T) {
+	cfg := testutil.CreateCorpus(t)
+	store, err := New(cfg.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents, err := store.DiscoverMarkdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pmids := make([]string, 0, len(documents))
+	for _, document := range documents {
+		pmids = append(pmids, document.PMID)
+		if filepath.Base(document.Path) != "markdown.md" {
+			t.Fatalf("unexpected Markdown path: %s", document.Path)
+		}
+	}
+	if !slices.Equal(pmids, []string{"12345678", "23456789"}) {
+		t.Fatalf("unexpected Markdown documents: %v", pmids)
+	}
+
+	missingPath := filepath.Join(cfg.Root, "23456789", "markdown.md")
+	if err := os.Remove(missingPath); err != nil {
+		t.Fatal(err)
+	}
+	documents, err = store.DiscoverMarkdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(documents) != 1 || documents[0].PMID != "12345678" {
+		t.Fatalf("document without Markdown was included: %+v", documents)
+	}
+	if _, err := store.DocumentDir("23456789"); !os.IsNotExist(err) {
+		t.Fatalf("document cache retained missing Markdown: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, missingPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DiscoverMarkdown(); err == nil {
+		t.Fatal("Markdown symlink escape succeeded")
 	}
 }
 
