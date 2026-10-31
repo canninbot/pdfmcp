@@ -1147,7 +1147,7 @@ func markdownReaderMatches(
 	matcher *lowerMatcher,
 	lineBuffer *bytes.Buffer,
 ) (bool, error) {
-	if strings.ContainsAny(options.Query, "\r\n") {
+	if options.Mode == "literal" && strings.ContainsAny(options.Query, "\r\n") {
 		return false, nil
 	}
 	lineBuffer.Reset()

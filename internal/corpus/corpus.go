@@ -130,6 +130,9 @@ func (s *Store) DiscoverMarkdown() ([]MarkdownDocument, error) {
 			}
 			return err
 		}
+		if !info.Mode().IsRegular() && !hasMineruFile(path) {
+			return nil
+		}
 		resolved := markdownPath
 		if info.Mode()&os.ModeSymlink != 0 {
 			resolved, err = s.ensureInside(markdownPath)

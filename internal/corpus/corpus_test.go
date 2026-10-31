@@ -85,6 +85,47 @@ func TestDiscoverMarkdownCachesResolvedDocuments(t *testing.T) {
 	}
 }
 
+func TestDiscoverMarkdownIgnoresUnusableMarkdownOnlyEntries(t *testing.T) {
+	cfg := testutil.CreateCorpus(t)
+	brokenDirectory := filepath.Join(cfg.Root, "34567890")
+	if err := os.Mkdir(brokenDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(
+		filepath.Join(cfg.Root, "missing.md"),
+		filepath.Join(brokenDirectory, "markdown.md"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	nonregularDirectory := filepath.Join(cfg.Root, "45678901")
+	if err := os.MkdirAll(filepath.Join(nonregularDirectory, "markdown.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := New(cfg.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents, err := store.DiscoverMarkdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pmids := make([]string, 0, len(documents))
+	for _, document := range documents {
+		pmids = append(pmids, document.PMID)
+	}
+	if !slices.Equal(pmids, []string{"12345678", "23456789"}) {
+		t.Fatalf("unexpected Markdown documents: %v", pmids)
+	}
+	structuredPath := filepath.Join(nonregularDirectory, "structured_content.json")
+	if err := os.WriteFile(structuredPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DiscoverMarkdown(); err == nil {
+		t.Fatal("non-regular Markdown in a MinerU document was accepted")
+	}
+}
+
 func TestResolveIndexedSourceWithoutDiscovery(t *testing.T) {
 	cfg := testutil.CreateCorpus(t)
 	store, err := New(cfg.Root)

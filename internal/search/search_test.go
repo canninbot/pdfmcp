@@ -82,6 +82,128 @@ func TestMarkdownReaderMatchesLongAndFinalLines(t *testing.T) {
 	}
 }
 
+func TestMarkdownReaderMatchesLegacySemantics(t *testing.T) {
+	documents := [][]byte{
+		{},
+		[]byte("foo"),
+		[]byte("foo\n"),
+		[]byte("first\r\nfoo bar\r\nlast"),
+		[]byte("a\nbar\nb"),
+		[]byte("ſin3 and β-catenin\n"),
+		append(bytes.Repeat([]byte{'x'}, 70*1024), []byte("TaRgEt\n")...),
+	}
+	options := []Options{
+		{Query: "foo", Mode: "literal"},
+		{Query: "FOO", Mode: "literal", CaseSensitive: true},
+		{Query: "target", Mode: "literal"},
+		{Query: "foo\nbar", Mode: "literal"},
+		{Query: "foo", Mode: "regex"},
+		{Query: "^foo$", Mode: "regex"},
+		{Query: `foo\s+bar`, Mode: "regex"},
+		{Query: `foo.*bar`, Mode: "regex"},
+		{Query: `^$`, Mode: "regex"},
+		{Query: "foo|\nbar", Mode: "regex"},
+		{Query: "sin3", Mode: "regex"},
+		{Query: "β-CATENIN", Mode: "regex"},
+	}
+	for documentIndex, data := range documents {
+		for optionIndex, option := range options {
+			var compiled *regexp.Regexp
+			if option.Mode == "regex" {
+				pattern := option.Query
+				if !option.CaseSensitive {
+					pattern = "(?i)" + pattern
+				}
+				compiled = regexp.MustCompile(pattern)
+			}
+			var matcher *lowerMatcher
+			if option.Mode == "literal" && !option.CaseSensitive {
+				matcher = newLowerMatcher(option.Query)
+			}
+			reader := bufio.NewReaderSize(bytes.NewReader(data), 16)
+			got, err := markdownReaderMatches(
+				reader, option, compiled, matcher, &bytes.Buffer{},
+			)
+			if err != nil {
+				t.Fatalf("document %d option %d: %v", documentIndex, optionIndex, err)
+			}
+			want := legacyMarkdownDataMatches(data, option, compiled, matcher)
+			if got != want {
+				t.Fatalf(
+					"document %d option %d: got %t, want %t for query %q",
+					documentIndex, optionIndex, got, want, option.Query,
+				)
+			}
+		}
+	}
+}
+
+func legacyMarkdownDataMatches(
+	data []byte,
+	options Options,
+	compiled *regexp.Regexp,
+	matcher *lowerMatcher,
+) bool {
+	if options.Mode == "regex" {
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			line = bytes.TrimSuffix(line, []byte{'\r'})
+			if compiled.Match(line) {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.ContainsAny(options.Query, "\r\n") {
+		return false
+	}
+	if options.CaseSensitive {
+		return bytes.Contains(data, []byte(options.Query))
+	}
+	return matcher.MatchBytes(data)
+}
+
+func TestIndexASCIIFoldMatchesReference(t *testing.T) {
+	haystacks := [][]byte{
+		{},
+		[]byte("ABC xyz abc"),
+		[]byte("punctuation: A-B_C"),
+		[]byte("mixed MiXeD case"),
+		append(bytes.Repeat([]byte{'x'}, 4096), []byte("Needle")...),
+	}
+	needles := [][]byte{
+		{}, []byte("a"), []byte("abc"), []byte("xyz"), []byte("a-b"),
+		[]byte("mixed"), []byte("needle"), []byte("absent"),
+	}
+	for _, haystack := range haystacks {
+		for _, needle := range needles {
+			got := indexASCIIFold(haystack, needle)
+			want := referenceIndexASCIIFold(haystack, needle)
+			if got != want {
+				t.Fatalf("indexASCIIFold(%q, %q)=%d, want %d", haystack, needle, got, want)
+			}
+		}
+	}
+}
+
+func referenceIndexASCIIFold(data, needle []byte) int {
+	if len(needle) == 0 {
+		return 0
+	}
+	for start := 0; start+len(needle) <= len(data); start++ {
+		matched := true
+		for position := range needle {
+			if foldASCII(data[start+position]) != needle[position] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return start
+		}
+	}
+	return -1
+}
+
 func TestRankedLiteralRegexScopesAndPagination(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.CreateCorpus(t)
