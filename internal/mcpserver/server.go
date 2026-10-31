@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	version              = "0.1.4"
+	version              = "0.2.0"
 	maxToolJSONBytes     = 4 << 20
 	maxResourceBytes     = 100 << 20
 	maxInlinePDFBytes    = 1 << 20
