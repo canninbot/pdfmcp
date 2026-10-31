@@ -16,11 +16,7 @@ fmt:
 
 release: clean
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o dist/$(APPNAME)-linux-amd64 ./cmd/pdfmcp
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -o dist/$(APPNAME)-linux-arm64 ./cmd/pdfmcp
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -trimpath -o dist/$(APPNAME)-darwin-amd64 ./cmd/pdfmcp
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -o dist/$(APPNAME)-darwin-arm64 ./cmd/pdfmcp
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -o dist/$(APPNAME)-windows-amd64.exe ./cmd/pdfmcp
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -trimpath -o dist/$(APPNAME)-windows-arm64.exe ./cmd/pdfmcp
 
 current:
 	mkdir -p dist

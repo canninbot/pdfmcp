@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -10,6 +11,39 @@ import (
 	indexdb "github.com/canninbot/pdfmcp/internal/index"
 	"github.com/canninbot/pdfmcp/internal/testutil"
 )
+
+func TestFilesystemSearchWithoutIndex(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.CreateCorpus(t)
+	engine, err := NewFilesystem(cfg.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := engine.Search(ctx, Options{
+		Query: "tead inhibition", Mode: "literal", Scope: "text", Output: "pmids",
+	})
+	if err != nil || !slices.Equal(response.PMIDs, []string{"12345678", "23456789"}) {
+		t.Fatalf("indexless literal search: %+v, %v", response, err)
+	}
+	response, err = engine.Search(ctx, Options{
+		Query: `TEAD\s+inhibition`, Mode: "regex", Scope: "text", Limit: 1, Offset: 1,
+	})
+	if err != nil || len(response.Results) != 1 || response.Results[0].PMID != "23456789" {
+		t.Fatalf("indexless regex pagination: %+v, %v", response, err)
+	}
+	for _, options := range []Options{
+		{Query: "TEAD", Mode: "ranked", Scope: "text"},
+		{Query: "TEAD", Mode: "literal", Scope: "all"},
+		{Query: "TEAD", Mode: "literal", Scope: "metadata"},
+	} {
+		if _, err := engine.Search(ctx, options); err == nil {
+			t.Fatalf("unsupported indexless options succeeded: %+v", options)
+		}
+	}
+	if _, err := os.Stat(cfg.Database); !os.IsNotExist(err) {
+		t.Fatalf("indexless search created a database: %v", err)
+	}
+}
 
 func TestRankedLiteralRegexScopesAndPagination(t *testing.T) {
 	ctx := context.Background()

@@ -29,7 +29,7 @@ const usage = `pdfmcp - local MinerU PDF search MCP
 Usage:
   pdfmcp index --root /data/pdfs [--database PATH] [--annotations FILE.csv] [--rebuild]
   pdfmcp serve --root /data/pdfs [--database PATH] [--sync] [--transport stdio|streamable-http] [--public-url URL]
-  pdfmcp search "TEAD inhibition" --root /data/pdfs [search options]
+  pdfmcp search "TEAD inhibition" --root /data/pdfs [--no-index] [search options]
   pdfmcp stats --root /data/pdfs [--database PATH]
   pdfmcp doctor --root /data/pdfs [--database PATH]
 `
@@ -239,6 +239,7 @@ func runSearch(ctx context.Context, arguments []string) error {
 	offset := flags.Int("offset", 0, "result offset")
 	output := flags.String("output", "full", "pmids, snippets, or full")
 	debug := flags.Bool("debug", false, "include query-planner diagnostics")
+	noIndex := flags.Bool("no-index", false, "scan Markdown directly without a SQLite index; requires literal or regex text mode")
 	metadataFilters := make([]search.MetadataFilter, 0)
 	flags.Func("metadata-filter", "repeatable numeric predicate, for example cited_by_count>100", func(value string) error {
 		filter, err := search.ParseMetadataFilter(value)
@@ -258,12 +259,24 @@ func runSearch(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
-	db, err := indexdb.Open(ctx, cfg, true)
-	if err != nil {
-		return err
+	var engine *search.Engine
+	if *noIndex {
+		if *database != "" {
+			return errors.New("--database cannot be used with --no-index")
+		}
+		engine, err = search.NewFilesystem(cfg.Root)
+		if err != nil {
+			return err
+		}
+	} else {
+		db, openErr := indexdb.Open(ctx, cfg, true)
+		if openErr != nil {
+			return openErr
+		}
+		defer db.Close()
+		engine = search.New(db)
 	}
-	defer db.Close()
-	response, err := search.New(db).Search(ctx, search.Options{
+	response, err := engine.Search(ctx, search.Options{
 		Query: query, Mode: *mode, Scope: *scope, CaseSensitive: *caseSensitive,
 		ContextLines: *contextLines, Limit: *limit, Offset: *offset, Output: *output,
 		Debug: *debug, MetadataFilters: metadataFilters,

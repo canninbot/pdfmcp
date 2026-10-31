@@ -109,14 +109,49 @@ type Debug struct {
 
 // Engine shares search logic between the CLI and MCP server.
 type Engine struct {
-	index         *indexdb.DB
-	markdownPaths sync.Map
-	markdownData  sync.Pool
+	index              *indexdb.DB
+	store              *corpus.Store
+	unindexedDocuments []indexdb.Document
+	markdownPaths      sync.Map
+	markdownData       sync.Pool
 }
 
 // New returns a search engine using index.
 func New(index *indexdb.DB) *Engine {
-	return &Engine{index: index}
+	return &Engine{index: index, store: index.Store()}
+}
+
+// NewFilesystem returns an indexless engine for exact Markdown text searches.
+func NewFilesystem(root string) (*Engine, error) {
+	store, err := corpus.New(root)
+	if err != nil {
+		return nil, err
+	}
+	pmids, err := store.Discover()
+	if err != nil {
+		return nil, err
+	}
+	documents := make([]indexdb.Document, 0, len(pmids))
+	for _, pmid := range pmids {
+		if _, err := store.ResolveSource(pmid, "markdown.md"); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("resolve Markdown for PMID %s: %w", pmid, err)
+		}
+		dir, err := store.DocumentDir(pmid)
+		if err != nil {
+			return nil, err
+		}
+		relative, err := filepath.Rel(store.Root(), dir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve relative document path for PMID %s: %w", pmid, err)
+		}
+		documents = append(documents, indexdb.Document{
+			PMID: pmid, RelativePath: filepath.ToSlash(relative),
+		})
+	}
+	return &Engine{store: store, unindexedDocuments: documents}, nil
 }
 
 // Search validates options and runs exactly one selected search mode.
@@ -125,6 +160,14 @@ func (e *Engine) Search(ctx context.Context, options Options) (Response, error) 
 	defer cancel()
 	if err := normalizeOptions(&options); err != nil {
 		return Response{}, err
+	}
+	if e.index == nil {
+		if options.Scope != "text" {
+			return Response{}, errors.New("indexless search supports only scope text")
+		}
+		if options.Mode != "literal" && options.Mode != "regex" {
+			return Response{}, errors.New("indexless search requires mode literal or regex")
+		}
 	}
 	if options.Scope == "metadata" && !e.index.HasAnnotationIndex() {
 		return Response{}, errors.New("metadata annotations are unavailable; run pdfmcp index with --annotations")
@@ -1124,7 +1167,7 @@ func (e *Engine) markdownPath(document indexdb.Document) (string, error) {
 	if cached, ok := e.markdownPaths.Load(document.PMID); ok {
 		return cached.(string), nil
 	}
-	path, err := e.index.Store().ResolveIndexedSource(
+	path, err := e.store.ResolveIndexedSource(
 		document.PMID, document.RelativePath, "markdown.md",
 	)
 	if err != nil {
@@ -1369,6 +1412,22 @@ func matchingLines(document indexdb.Document, lines []string, options Options, r
 func (e *Engine) candidateDocuments(ctx context.Context, pmids []string) ([]indexdb.Document, error) {
 	if pmids != nil && len(pmids) == 0 {
 		return []indexdb.Document{}, nil
+	}
+	if e.index == nil {
+		if pmids == nil {
+			return append([]indexdb.Document(nil), e.unindexedDocuments...), nil
+		}
+		allowed := make(map[string]struct{}, len(pmids))
+		for _, pmid := range pmids {
+			allowed[pmid] = struct{}{}
+		}
+		documents := make([]indexdb.Document, 0, len(pmids))
+		for _, document := range e.unindexedDocuments {
+			if _, ok := allowed[document.PMID]; ok {
+				documents = append(documents, document)
+			}
+		}
+		return documents, nil
 	}
 	query := `SELECT pmid, COALESCE(title, ''), relative_path FROM documents`
 	arguments := make([]any, 0, 1)

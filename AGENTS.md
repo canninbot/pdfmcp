@@ -12,6 +12,11 @@ make current
 make release
 ```
 
+The supported release grid is limited to:
+
+- `dist/pdfmcp-linux-amd64`
+- `dist/pdfmcp-darwin-arm64`
+
 For a synthetic or real corpus:
 
 ```bash
@@ -37,7 +42,7 @@ For a synthetic or real corpus:
 - Keep source paths relative in SQLite and constrain all reads to the corpus root.
 - Preserve stdout exclusively for MCP protocol data in `serve` mode.
 - Do not infer unknown MinerU bounding-box coordinate systems.
-- Keep the deployed artifact to one executable plus the user corpus and its SQLite index.
+- Keep the deployed artifact to one executable plus the user corpus and, for full indexed operation, its SQLite index.
 
 ## Testing Requirements
 

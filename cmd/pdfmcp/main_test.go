@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,9 +16,32 @@ import (
 
 	indexdb "github.com/canninbot/pdfmcp/internal/index"
 	"github.com/canninbot/pdfmcp/internal/mcpserver"
+	"github.com/canninbot/pdfmcp/internal/search"
 	"github.com/canninbot/pdfmcp/internal/testutil"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestSearchNoIndexCLI(t *testing.T) {
+	cfg := testutil.CreateCorpus(t)
+	command := exec.Command(os.Args[0], "-test.run=TestMCPHelperProcess", "--",
+		"search", "TEAD", "--no-index", "--mode", "literal", "--scope", "text",
+		"--output", "pmids", "--root", cfg.Root)
+	command.Env = append(os.Environ(), "PDFMCP_HELPER_PROCESS=1")
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response search.Response
+	if err := json.Unmarshal(output, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(response.PMIDs, []string{"12345678", "23456789"}) {
+		t.Fatalf("unexpected indexless CLI results: %+v", response)
+	}
+	if _, err := os.Stat(cfg.Database); !os.IsNotExist(err) {
+		t.Fatalf("indexless CLI created a database: %v", err)
+	}
+}
 
 // TestMCPStdioDiscoveryAndInvocation exercises the real newline-delimited
 // stdin/stdout transport in a subprocess using the current test executable.

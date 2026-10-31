@@ -206,6 +206,11 @@ make current
 ./dist/pdfmcp help
 ```
 
+`make release` builds the supported release grid:
+
+- `dist/pdfmcp-linux-amd64`
+- `dist/pdfmcp-darwin-arm64`
+
 `make` runs tests first, creates release binaries, and leaves the current-system binary at `dist/pdfmcp`. All builds use `CGO_ENABLED=0`. Dependencies are pinned in `go.mod` and `go.sum`:
 
 - Official `github.com/modelcontextprotocol/go-sdk`
@@ -252,11 +257,24 @@ pdfmcp search 'Clinical Trial' --mode literal --scope metadata --root /data/pdfs
 pdfmcp search --scope metadata --metadata-filter 'cited_by_count>100' \
   --output pmids --root /data/pdfs
 
+# Explicit indexless Markdown scan
+pdfmcp search 'exact substring' --no-index --mode literal --scope text \
+  --root /data/pdfs
+pdfmcp search 'TEAD\s+(inhibition|blockade)' --no-index --mode regex \
+  --scope text --root /data/pdfs
+
 pdfmcp stats --root /data/pdfs
 pdfmcp doctor --root /data/pdfs
 ```
 
 The server never synchronizes automatically. Use `serve --sync` only when an explicit startup sync is wanted. In stdio mode, stdout carries MCP messages exclusively and diagnostics go to stderr.
+
+`search --no-index` explicitly bypasses SQLite and scans discovered
+`markdown.md` files with the built-in Go implementation. It supports only
+`literal` or `regex` mode with `scope=text`; ranked search, metadata, figures,
+tables, statistics, diagnostics, and MCP serving still require the index. The
+flag does not create `papers.sqlite`, cannot be combined with `--database`, and
+does not invoke `grep`, `rg`, or another external executable.
 
 Metadata annotations are optional and separate from extracted paper content.
 `index --annotations FILE.csv` imports the PMID-keyed CSV produced by
@@ -364,6 +382,7 @@ though they can read them.
 - `--root`: corpus directory; defaults to `./pdfs`
 - `--database`: SQLite path; defaults to `ROOT/papers.sqlite`
 - `index --annotations`: optional PMID metadata annotation CSV; omitted by default
+- `search --no-index`: explicit literal/regex scan of Markdown text without SQLite
 - `search --metadata-filter`: repeatable numeric metadata predicate such as `cited_by_count>100`
 - `serve --transport`: `stdio` (default) or `streamable-http`
 - `serve --listen`: HTTP listen address; defaults to `127.0.0.1:8080`
