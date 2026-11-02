@@ -98,6 +98,13 @@ codex mcp add pdfmcp -- \
   --root /absolute/path/to/pdfmcp/pdfs
 ```
 
+For example, using this checkout's built executable and an already indexed
+corpus directory:
+
+```bash
+codex mcp add pdfmcp -- "/home/user/pdfmcp/dist/pdfmcp" serve --root "/absolute/path/to/indexed/files"
+```
+
 Confirm that Codex saved the server:
 
 ```bash
